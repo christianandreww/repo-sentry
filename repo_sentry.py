@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import collections
 import contextlib
 import dataclasses
@@ -1012,11 +1013,12 @@ def _sev_for_arg(constant: bool) -> str:
     return "medium" if constant else "critical"
 
 
-def scan_pattern_sinks(sf: SourceFile, emit) -> None:
+def scan_pattern_sinks(sf: SourceFile, emit, masked: Optional[str] = None) -> None:
     """RS-SEC-003 / RS-SEC-004 for non-Python languages. Pattern-based,
-    confidence is low or medium by design."""
+    confidence is low or medium by design. JS/TS runs on lexically masked
+    text (comments, strings, template text and regex bodies blanked)."""
     if sf.lang == "js":
-        stripped = js_mask(sf.text, jsx=js_allows_jsx(sf.rel)).splitlines()
+        stripped = (masked if masked is not None else js_mask(sf.text, jsx=js_allows_jsx(sf.rel))).splitlines()
     else:
         stripped = strip_comments(sf.text, sf.lang).splitlines()
     rem3 = RULES["RS-SEC-003"].remediation
@@ -1370,6 +1372,338 @@ def js_mask(text: str, jsx: bool = True) -> str:
                 last = i + len(stripped) - 1
             i = j
     return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: approximate function discovery and metrics
+# --------------------------------------------------------------------------
+_JS_CONTROL_WORDS = frozenset((
+    "if", "for", "while", "switch", "catch", "with", "function", "return", "else", "do", "try",
+    "finally", "new", "typeof", "await", "yield", "delete", "void", "throw", "in", "of", "instanceof",
+    "case", "default", "import", "export", "class", "extends", "super", "async", "this", "let", "const",
+    "var", "type", "interface", "enum", "declare", "namespace", "module", "satisfies", "as", "is",
+))
+_JS_FUNC_KW_RE = re.compile(r"(?<![\w$.@])(?:async\s+)?function\b\s*\*?\s*(?:([A-Za-z_$][\w$]*)\s*)?(?:<[^<>()]*>\s*)?\(")
+_JS_ARROW_RE = re.compile(r"=>\s*\{")
+_JS_METHOD_RE = re.compile(
+    r"(?<![\w$.@#])(?:(?:public|private|protected|static|async|readonly|override|abstract|declare|get|set)\s+)*"
+    r"\*?\s*(#?[A-Za-z_$][\w$]*)\s*\??\s*(?:<[^<>()]*>\s*)?\(")
+_JS_EXPORT_DEFAULT_TAIL_RE = re.compile(r"export\s+default\s*$")
+_JS_ARROW_NAME_RES = (
+    re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*$"),
+    re.compile(r"([A-Za-z_$][\w$.]*)\s*(?::[^=:]*)?=\s*$"),
+    re.compile(r"([A-Za-z_$][\w$]*)\s*:\s*$"),
+)
+_JS_CC_IF_RE = re.compile(r"(?<![\w$.])if\s*\(")
+_JS_CC_FOR_RE = re.compile(r"(?<![\w$.])for\s*(?:await\s*)?\(")
+_JS_CC_WHILE_RE = re.compile(r"(?<![\w$.])while\s*\(")
+_JS_CC_CASE_RE = re.compile(r"(?<![\w$.])case\b")
+_JS_CC_CATCH_RE = re.compile(r"(?<![\w$.])catch\b")
+_JS_CC_LOGIC_RE = re.compile(r"&&|\|\||\?\?")
+_JS_CC_TERNARY_RE = re.compile(r"(?<![?])\?(?![.?:,)\]>])")
+_JS_BLOCK_KW_RE = re.compile(r"(?<![\w$.])(if|for|while|do|switch|try)\b")
+_JS_EMPTY_CATCH_RE = re.compile(r"(?<![\w$.])catch\s*(?:\([^()]*\))?\s*\{\s*\}")
+_JS_TEST_FILE_RE = re.compile(r"(?:^|/)(?:__tests__|__mocks__)/|\.(?:test|spec)\.[cm]?[jt]sx?$", re.IGNORECASE)
+
+
+def js_is_test_file(rel: str) -> bool:
+    return bool(_JS_TEST_FILE_RE.search(rel))
+
+
+def js_is_declaration_file(rel: str) -> bool:
+    return rel.lower().endswith((".d.ts", ".d.mts", ".d.cts"))
+
+
+def js_line_starts(text: str) -> List[int]:
+    starts = [0]
+    pos = text.find("\n")
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = text.find("\n", pos + 1)
+    return starts
+
+
+def js_line_col(starts: Sequence[int], offset: int) -> Tuple[int, int]:
+    line = bisect.bisect_right(starts, offset)
+    return line, offset - starts[line - 1] + 1
+
+
+def _js_match_forward(text: str, i: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket matching text[i] (which must be open_ch), or
+    len(text) when unterminated. Linear, on masked text."""
+    depth = 0
+    n = len(text)
+    k = i
+    while k < n:
+        ch = text[k]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return n
+
+
+def _js_match_backward(text: str, k: int, open_ch: str, close_ch: str) -> int:
+    depth = 0
+    while k >= 0:
+        ch = text[k]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k -= 1
+    return 0
+
+
+def _js_body_after_params(text: str, close_paren: int) -> int:
+    """Index of the `{` opening a function body after its `)` (skipping a TS
+    return type annotation), or -1 when there is no body (signature only)."""
+    n = len(text)
+    k = close_paren + 1
+    while k < n and text[k] in " \t\r\n":
+        k += 1
+    if k >= n:
+        return -1
+    if text[k] == "{":
+        return k
+    if text[k] != ":":
+        return -1
+    k += 1
+    depth = 0
+    prev = ":"
+    arrow = False  # the previous significant token was `=>`
+    while k < n:
+        ch = text[k]
+        if ch in " \t\r\n":
+            k += 1
+            continue
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == ">":
+            if prev == "=":
+                arrow = True
+                prev = ch
+                k += 1
+                continue
+            depth -= 1
+        elif ch == "{":
+            if depth <= 0:
+                if arrow or prev in ":|&,(<=":
+                    k = _js_match_forward(text, k, "{", "}") + 1
+                    prev = "}"
+                    arrow = False
+                    continue
+                return k
+        elif ch == ";" and depth <= 0:
+            return -1
+        prev = ch
+        arrow = False
+        k += 1
+    return -1
+
+
+def _js_arrow_name(text: str, params_start: int) -> str:
+    pre = text[max(0, params_start - 240):params_start].rstrip()
+    if pre.endswith("async"):
+        pre = pre[:-5].rstrip()
+    if _JS_EXPORT_DEFAULT_TAIL_RE.search(pre):
+        return "default"
+    for rx in _JS_ARROW_NAME_RES:
+        m = rx.search(pre)
+        if m:
+            return m.group(1).split(".")[-1]
+    return "<anonymous>"
+
+
+@dataclasses.dataclass
+class JsFunction:
+    name: str
+    start: int        # offset of the header (keyword, name or parameter list)
+    body_start: int   # offset of the `{`
+    body_end: int     # offset of the matching `}` (len(text) if unterminated)
+    children: List["JsFunction"] = dataclasses.field(default_factory=list)
+
+
+def js_discover_functions(masked: str) -> List[JsFunction]:
+    """Approximate function discovery on masked text: `function` declarations
+    and expressions, arrow functions with block bodies, class/object methods,
+    getters/setters, constructors. Returns functions sorted by body start
+    with parent/child nesting resolved."""
+    found: Dict[int, JsFunction] = {}
+
+    def add(name: str, start: int, body: int) -> None:
+        if body in found:
+            return
+        found[body] = JsFunction(name, start, body, _js_match_forward(masked, body, "{", "}"))
+
+    for m in _JS_FUNC_KW_RE.finditer(masked):
+        close = _js_match_forward(masked, m.end() - 1, "(", ")")
+        body = _js_body_after_params(masked, close)
+        if body < 0:
+            continue
+        name = m.group(1)
+        if not name:
+            name = "default" if _JS_EXPORT_DEFAULT_TAIL_RE.search(masked[max(0, m.start() - 40):m.start()]) else "<anonymous>"
+        add(name, m.start(), body)
+    for m in _JS_METHOD_RE.finditer(masked):
+        name = m.group(1)
+        if name.lstrip("#") in _JS_CONTROL_WORDS:
+            continue
+        close = _js_match_forward(masked, m.end() - 1, "(", ")")
+        body = _js_body_after_params(masked, close)
+        if body < 0 or body in found:
+            continue
+        add(name, m.start(), body)
+    for m in _JS_ARROW_RE.finditer(masked):
+        body = m.end() - 1
+        if body in found:
+            continue
+        k = m.start() - 1
+        while k >= 0 and masked[k] in " \t\r\n":
+            k -= 1
+        if k < 0:
+            continue
+        if masked[k] == ")":
+            ps = _js_match_backward(masked, k, "(", ")")
+        elif masked[k].isalnum() or masked[k] in "_$":
+            ps = k
+            while ps > 0 and (masked[ps - 1].isalnum() or masked[ps - 1] in "_$"):
+                ps -= 1
+        else:
+            continue
+        add(_js_arrow_name(masked, ps), ps, body)
+    funcs = sorted(found.values(), key=lambda f: f.body_start)
+    stack: List[JsFunction] = []
+    for f in funcs:
+        while stack and stack[-1].body_end < f.body_start:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(f)
+        stack.append(f)
+    return funcs
+
+
+def js_own_text(masked: str, start: int, end: int, children: Sequence[JsFunction]) -> str:
+    """masked[start:end] with the spans of nested functions blanked out."""
+    pieces: List[str] = []
+    pos = start
+    for child in children:
+        a = max(child.start, pos)
+        b = min(child.body_end + 1, end)
+        if a < pos or a >= end:
+            continue
+        pieces.append(masked[pos:a])
+        pieces.append(_JS_NOT_NEWLINE_RE.sub(" ", masked[a:b]))
+        pos = b
+    pieces.append(masked[pos:end])
+    return "".join(pieces)
+
+
+def js_complexity(own: str) -> int:
+    """Approximate McCabe complexity of a function's own (masked) text:
+    1 + if + for + while + case + catch + each && || ?? + each ternary."""
+    score = 1
+    for rx in (_JS_CC_IF_RE, _JS_CC_FOR_RE, _JS_CC_WHILE_RE, _JS_CC_CASE_RE, _JS_CC_CATCH_RE, _JS_CC_LOGIC_RE,
+               _JS_CC_TERNARY_RE):
+        score += len(rx.findall(own))
+    return score
+
+
+def js_max_nesting(own: str) -> Tuple[int, int]:
+    """(max depth, offset of the deepest block keyword) for if/for/while/do/
+    switch/try blocks; else/catch/finally do not add depth."""
+    n = len(own)
+    spans: List[Tuple[int, int, int]] = []
+    for m in _JS_BLOCK_KW_RE.finditer(own):
+        k = m.end()
+        while k < n and own[k] in " \t\r\n":
+            k += 1
+        if k >= n:
+            continue
+        if m.group(1) in ("do", "try"):
+            if own[k] != "{":
+                continue
+        else:
+            if own[k] != "(":
+                continue
+            k = _js_match_forward(own, k, "(", ")") + 1
+            while k < n and own[k] in " \t\r\n":
+                k += 1
+            if k >= n or own[k] != "{":
+                continue
+        spans.append((k, _js_match_forward(own, k, "{", "}"), m.start()))
+    spans.sort()
+    stack: List[int] = []
+    best_depth, best_pos = 0, -1
+    for b, e, pos in spans:
+        while stack and stack[-1] <= b:
+            stack.pop()
+        depth = len(stack) + 1
+        if depth > best_depth:
+            best_depth, best_pos = depth, pos
+        stack.append(e)
+    return best_depth, best_pos
+
+
+class JsAnalyzer:
+    """Approximate structural analysis of one JS/TS file on its masked text."""
+
+    def __init__(self, sf: SourceFile, config: Config, emit, enabled: Set[str]) -> None:
+        self.sf = sf
+        self.config = config
+        self.emit = emit
+        self.enabled = enabled
+        self.masked = js_mask(sf.text, jsx=js_allows_jsx(sf.rel))
+        self.starts = js_line_starts(sf.text)
+        self.funcs = js_discover_functions(self.masked)
+        self.test_file = js_is_test_file(sf.rel)
+
+    def _finding(self, rule_id: str, severity: str, confidence: str, offset: int, message: str,
+                 remediation: Optional[str] = None) -> None:
+        line, col = js_line_col(self.starts, offset)
+        self.emit(Finding(rule_id, severity, confidence, self.sf.rel, line, col, message,
+                          self.sf.snippet(line), remediation or RULES[rule_id].remediation))
+
+    def run_quality(self) -> None:
+        th = self.config.thresholds
+        max_cc = th.get("max_cyclomatic_complexity", 10)
+        max_depth = th.get("max_nesting_depth", 4)
+        want_cc = "RS-QUAL-001" in self.enabled
+        want_depth = "RS-QUAL-002" in self.enabled
+        if (want_cc or want_depth) and not self.test_file:
+            for f in self.funcs:
+                own = js_own_text(self.masked, f.body_start + 1, f.body_end, f.children)
+                if want_cc:
+                    cc = js_complexity(own)
+                    if cc > max_cc:
+                        severity = "high" if cc > 2 * max_cc else "medium"
+                        self._finding("RS-QUAL-001", severity, "medium", f.start,
+                                      "Function '%s' has cyclomatic complexity %d (threshold %d; approximate JS/TS estimate)"
+                                      % (f.name, cc, max_cc))
+                if want_depth:
+                    depth, pos = js_max_nesting(own)
+                    if depth > max_depth and pos >= 0:
+                        self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "medium", f.body_start + 1 + pos,
+                                      "Nesting depth %d exceeds %d in function '%s' (approximate JS/TS estimate)"
+                                      % (depth, max_depth, f.name))
+            if want_depth:
+                top = [f for f in self.funcs if not any(f is c for p in self.funcs for c in p.children)]
+                own = js_own_text(self.masked, 0, len(self.masked), top)
+                depth, pos = js_max_nesting(own)
+                if depth > max_depth and pos >= 0:
+                    self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "medium", pos,
+                                  "Nesting depth %d exceeds %d in module scope (approximate JS/TS estimate)" % (depth, max_depth))
+        if "RS-QUAL-004" in self.enabled:
+            for m in _JS_EMPTY_CATCH_RE.finditer(self.masked):
+                self._finding("RS-QUAL-004", RULES["RS-QUAL-004"].severity, "medium", m.start(),
+                              "Empty catch block silently swallows errors (approximate JS/TS check)")
 
 
 # --------------------------------------------------------------------------
@@ -2513,9 +2847,25 @@ class Scanner:
             record = analyzer.run()
             if record.name:
                 self.modules.append(record)
-        elif lang in ("js", "c", "shell"):
+        elif lang == "js":
+            self._scan_js(sf)
+        elif lang in ("c", "shell"):
             if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
                 scan_pattern_sinks(sf, self._emit)
+
+    def _scan_js(self, sf: SourceFile) -> None:
+        """JS/TS: masked-text structural rules, sinks and (later) imports.
+        Declaration files and minified/bundled files only get secret scanning."""
+        if js_is_declaration_file(sf.rel) or is_minified(sf.rel, sf.lines):
+            return
+        try:
+            analyzer = JsAnalyzer(sf, self.config, self._emit, self.enabled)
+        except (RecursionError, MemoryError, ValueError, IndexError) as exc:
+            self._sys_finding(sf.rel, 1, "JS/TS file could not be tokenized: %s: %s" % (type(exc).__name__, exc))
+            return
+        analyzer.run_quality()
+        if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
+            scan_pattern_sinks(sf, self._emit, analyzer.masked)
 
 
 def scan(root: str, config: Optional[Config] = None, rules: Optional[Set[str]] = None,
@@ -3723,6 +4073,128 @@ class TestJsMasking(_ProjectMixin, unittest.TestCase):
         findings = self.scan_files({"a.js": src})
         lines = sorted(f.line for f in self.by_rule(findings, "RS-SEC-004"))
         self.assertEqual(lines, [4, 5])
+
+
+class TestJsStructure(_ProjectMixin, unittest.TestCase):
+    FIXTURE = (
+        "function plain(a) { return [a].map(x => x + 1); }\n"                      # 1 declaration
+        "async function fetchIt(url) { const r = await get(url); return r; }\n"   # 2 async declaration
+        "function* gen() { yield 1; }\n"                                            # 3 generator
+        "const arrow = (a, b) => { return a + b; };\n"                              # 4 arrow with block body
+        "const asyncArrow = async x => { return x; };\n"                           # 5 async arrow, bare param
+        "export default () => { run(); };\n"                                        # 6 export default arrow
+        "class K extends Base {\n"
+        "  constructor(v) { super(); this.v = v; }\n"                               # 7 constructor
+        "  static async #load(id) { return id; }\n"                                 # 8 static async private method
+        "}\n"
+        "const obj = {\n"
+        "  handler(e) {\n"                                                          # 9 object-literal method
+        "    if (e) { while (e) { e--; } }\n"
+        "    for (const k of e) { switch (k) { case 1: break; } }\n"
+        "    try { x(); } catch (err) { log(err); }\n"
+        "    with (e) { y(); }\n"
+        "  },\n"
+        "};\n"
+    )
+
+    def test_function_discovery_names_and_count(self):
+        funcs = js_discover_functions(js_mask(self.FIXTURE))
+        names = [f.name for f in funcs]
+        self.assertEqual(len(funcs), 9)
+        self.assertEqual(names, ["plain", "fetchIt", "gen", "arrow", "asyncArrow", "default", "constructor",
+                                 "#load", "handler"])
+        for bad in ("if", "while", "catch", "for", "switch", "with"):
+            self.assertNotIn(bad, names)
+        self.assertTrue(all(f.body_end > f.body_start for f in funcs))
+
+    def test_typescript_signatures_and_return_types(self):
+        src = ("export function parse<T>(input: string, opts?: Options): { ok: boolean; value: T } {\n"
+               "  if (input) { return { ok: true, value: null as any }; }\n  return { ok: false, value: null as any };\n}\n"
+               "interface Api { load(id: string): Promise<void>; }\n"
+               "abstract class A { abstract run(): void; protected async step(n: number): Promise<number> { return n; } }\n")
+        funcs = js_discover_functions(js_mask(src))
+        self.assertEqual([f.name for f in funcs], ["parse", "step"])
+
+    @staticmethod
+    def metrics(src: str) -> Dict[str, Tuple[int, int]]:
+        masked = js_mask(src)
+        out: Dict[str, Tuple[int, int]] = {}
+        for f in js_discover_functions(masked):
+            own = js_own_text(masked, f.body_start + 1, f.body_end, f.children)
+            out[f.name] = (js_complexity(own), js_max_nesting(own)[0])
+        return out
+
+    def test_exact_complexity_samples(self):
+        # (a) 1 + three `if` = 4
+        a = "function a(x) { if (x) {} if (x > 1) {} if (x > 2) {} return x; }\n"
+        self.assertEqual(self.metrics(a)["a"][0], 4)
+        # (b) 1 + if + else-if (2) + for (1) + && || ?? (3) + ternary (1) + 3 cases (3, default not counted)
+        #     + catch (1) = 12
+        b = ("function b(x, y, z, k) {\n"
+             "  if (x) { } else if (y) { } else { }\n"
+             "  for (const i of z) { }\n"
+             "  const v = x && y || z ?? k;\n"
+             "  const w = x ? 1 : 2;\n"
+             "  switch (k) { case 1: break; case 2: break; case 3: break; default: break; }\n"
+             "  try { run(); } catch (e) { log(e); }\n"
+             "  return v + w;\n}\n")
+        self.assertEqual(self.metrics(b)["b"][0], 12)
+        # (c) optional chaining is not counted, `??` is: 1 + 1 = 2
+        c = "function c(a) { return a?.b ?? c; }\n"
+        self.assertEqual(self.metrics(c)["c"][0], 2)
+        # (d) the nested arrow's `if` belongs to `inner` (1 + 1 = 2), the parent keeps its own `if` (1 + 1 = 2)
+        d = ("function d(a) {\n  const inner = (q) => { if (q) { return 1; } return 2; };\n"
+             "  if (a) { return inner(a); }\n  return 0;\n}\n")
+        m = self.metrics(d)
+        self.assertEqual(m["d"][0], 2)
+        self.assertEqual(m["inner"][0], 2)
+        # TS optional parameters and properties are not ternaries
+        e = "function e(a?: number, b?: string) { const o: { p?: number } = {}; return a ? o : b; }\n"
+        self.assertEqual(self.metrics(e)["e"][0], 2)
+
+    def test_complexity_threshold_via_scan(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return -1;\n}\n" % branches
+        findings = self.scan_files({"a.js": src})
+        hits = self.by_rule(findings, "RS-QUAL-001")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].severity, "medium")
+        self.assertEqual(hits[0].confidence, "medium")
+        self.assertIn("approximate", hits[0].message)
+        self.assertEqual(hits[0].line, 1)
+        findings = self.scan_files({"a.js": src}, {"thresholds": {"max_cyclomatic_complexity": 5}})
+        self.assertEqual(self.by_rule(findings, "RS-QUAL-001")[0].severity, "high")
+
+    def test_nesting_depth(self):
+        deep = ("function f(a) {\n  if (a) {\n    if (a) {\n      if (a) {\n        if (a) {\n"
+                "          if (a) { run(); }\n        }\n      }\n    }\n  }\n}\n")
+        findings = self.scan_files({"a.ts": deep})
+        hits = self.by_rule(findings, "RS-QUAL-002")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("depth 5", hits[0].message)
+        self.assertEqual(hits[0].line, 6)
+        chain = ("function g(a) {\n" + "  if (a === 0) { run(); }\n" +
+                 "".join("  else if (a === %d) { run(); }\n" % i for i in range(1, 7)) + "  else { run(); }\n}\n")
+        self.assertEqual(self.metrics(chain)["g"][1], 1)
+        self.assertEqual(self.by_rule(self.scan_files({"a.ts": chain}), "RS-QUAL-002"), [])
+        four = "function h(a) {\n  for (;;) {\n    while (a) {\n      try {\n        if (a) { run(); }\n      } catch (e) { log(e); }\n    }\n  }\n}\n"
+        self.assertEqual(self.by_rule(self.scan_files({"a.js": four}), "RS-QUAL-002"), [])
+
+    def test_empty_catch(self):
+        src = ("try { a(); } catch (e) {}\n"
+               "try { b(); } catch {\n  // ignore\n}\n"
+               "try { c(); } catch (e) { console.error(e); }\n"
+               "try { d(); } catch (e) { /* nothing */ }\n")
+        findings = self.scan_files({"a.js": src})
+        hits = self.by_rule(findings, "RS-QUAL-004")
+        self.assertEqual(sorted(f.line for f in hits), [1, 2, 6])
+        self.assertTrue(all(f.severity == "medium" and f.confidence == "medium" for f in hits))
+
+    def test_test_files_skip_quality_rules(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return -1;\n}\n" % branches
+        findings = self.scan_files({"big.test.js": src, "__tests__/other.js": src, "src/big.js": src})
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-QUAL-001")], ["src/big.js"])
 
 
 if __name__ == "__main__":
