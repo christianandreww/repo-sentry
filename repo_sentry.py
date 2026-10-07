@@ -19,6 +19,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import stat as statmod
 import subprocess
@@ -1705,6 +1706,184 @@ class JsAnalyzer:
                 self._finding("RS-QUAL-004", RULES["RS-QUAL-004"].severity, "medium", m.start(),
                               "Empty catch block silently swallows errors (approximate JS/TS check)")
 
+    def collect_imports(self) -> List["JsImport"]:
+        """Import specifiers found on the masked text (so comments and strings
+        cannot contribute), read back from the original text. `import type`,
+        `export type`, dynamic `import()` and imports inside a function body
+        are soft."""
+        masked, text = self.masked, self.sf.text
+        found: Dict[int, JsImport] = {}
+
+        def inside_function(pos: int) -> bool:
+            return any(f.body_start < pos < f.body_end for f in self.funcs)
+
+        def add(qpos: int, soft: bool) -> None:
+            if qpos in found or qpos >= len(text):
+                return
+            quote = text[qpos]
+            end = text.find(quote, qpos + 1)
+            if end == -1:
+                return
+            spec = text[qpos + 1:end]
+            if not spec or "\n" in spec:
+                return
+            line, col = js_line_col(self.starts, qpos)
+            found[qpos] = JsImport(spec, line, col, soft or inside_function(qpos), self.sf.snippet(line))
+
+        for m in _JS_IMPORT_FROM_RE.finditer(masked):
+            add(m.start(3), bool(_JS_TYPE_ONLY_RE.match(m.group(2))))
+        for m in _JS_IMPORT_SIDE_RE.finditer(masked):
+            add(m.start(1), False)
+        for m in _JS_IMPORT_DYN_RE.finditer(masked):
+            add(m.start(1), True)
+        for m in _JS_REQUIRE_RE.finditer(masked):
+            add(m.start(1), False)
+        return [found[k] for k in sorted(found)]
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: import graph (relative specifiers + tsconfig paths)
+# --------------------------------------------------------------------------
+_JS_IMPORT_FROM_RE = re.compile(r"(?<![\w$.])(import|export)\b([^;'\"`=]*?)\bfrom\s*(['\"])")
+_JS_TYPE_ONLY_RE = re.compile(r"\s*type\b(?!\s*,)")
+_JS_IMPORT_SIDE_RE = re.compile(r"(?<![\w$.])import\s*(['\"])")
+_JS_IMPORT_DYN_RE = re.compile(r"(?<![\w$.])import\s*\(\s*(['\"])")
+_JS_REQUIRE_RE = re.compile(r"(?<![\w$.])require\s*\(\s*(['\"])")
+JS_RESOLVE_EXTS: Tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json")
+_JS_TS_ALTERNATIVES: Dict[str, Tuple[str, ...]] = {
+    ".js": (".ts", ".tsx", ".d.ts"), ".jsx": (".tsx",), ".mjs": (".mts",), ".cjs": (".cts",),
+}
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+@dataclasses.dataclass
+class JsImport:
+    specifier: str
+    lineno: int
+    col: int
+    soft: bool
+    snippet: str
+
+
+@dataclasses.dataclass
+class JsModule:
+    rel: str
+    imports: List[JsImport]
+
+
+@dataclasses.dataclass
+class JsPathAliases:
+    base_dir: str                           # directory of the tsconfig/jsconfig, relative to the scan root
+    base_url: Optional[str]                 # compilerOptions.baseUrl, relative to base_dir (None when absent)
+    paths: List[Tuple[str, List[str]]]      # compilerOptions.paths entries in declaration order
+
+
+def parse_jsonc(text: str) -> object:
+    """json.loads for tsconfig-style JSON: comments and trailing commas removed."""
+    stripped = strip_comments(text, "js")
+    stripped = _TRAILING_COMMA_RE.sub(r"\1", stripped)
+    return json.loads(stripped)
+
+
+def load_js_path_aliases(rel: str, text: str, warnings: List[str]) -> Optional[JsPathAliases]:
+    try:
+        data = parse_jsonc(text)
+    except ValueError as exc:
+        warnings.append("%s: cannot parse (%s); path aliases ignored" % (rel, exc))
+        return None
+    if not isinstance(data, dict):
+        warnings.append("%s: expected a JSON object; path aliases ignored" % rel)
+        return None
+    options = data.get("compilerOptions")
+    if not isinstance(options, dict):
+        return None
+    base_url = options.get("baseUrl")
+    if not isinstance(base_url, str) or not base_url.strip():
+        base_url = None
+    raw_paths = options.get("paths")
+    paths: List[Tuple[str, List[str]]] = []
+    if isinstance(raw_paths, dict):
+        for pattern, targets in raw_paths.items():
+            if isinstance(pattern, str) and isinstance(targets, list):
+                paths.append((pattern, [t for t in targets if isinstance(t, str)]))
+    if base_url is None and not paths:
+        return None
+    return JsPathAliases(posixpath.dirname(rel), base_url, paths)
+
+
+def _alias_capture(pattern: str, spec: str) -> Optional[str]:
+    if "*" in pattern:
+        prefix, suffix = pattern.split("*", 1)
+        if spec.startswith(prefix) and spec.endswith(suffix) and len(spec) >= len(prefix) + len(suffix):
+            return spec[len(prefix):len(spec) - len(suffix)]
+        return None
+    return "" if spec == pattern else None
+
+
+def js_module_name(rel: str) -> str:
+    """POSIX relative path without extension (`src/a/index` for src/a/index.ts)."""
+    return posixpath.splitext(rel)[0]
+
+
+def js_layer_name(name: str, package_roots: Sequence[str]) -> str:
+    """Dotted path under the first matching package root, so layer names map
+    to the first path segment under that root."""
+    for root in package_roots:
+        r = root.strip().strip("/").replace("\\", "/")
+        if r in ("", "."):
+            return name.replace("/", ".")
+        if name.startswith(r + "/"):
+            return name[len(r) + 1:].replace("/", ".")
+    return name.replace("/", ".")
+
+
+class JsModuleResolver:
+    def __init__(self, known_rels: Iterable[str], aliases: Sequence[JsPathAliases]) -> None:
+        self.known: Set[str] = set(known_rels)
+        self.aliases = list(aliases)
+
+    def _try(self, base: str) -> Optional[str]:
+        if base.startswith("../") or base in ("..", ".", ""):
+            return None
+        if base in self.known:
+            return base
+        for ext in JS_RESOLVE_EXTS:
+            if base + ext in self.known:
+                return base + ext
+        stem, ext = posixpath.splitext(base)
+        for alt in _JS_TS_ALTERNATIVES.get(ext, ()):
+            if stem + alt in self.known:
+                return stem + alt
+        for ext in JS_RESOLVE_EXTS:
+            cand = base + "/index" + ext
+            if cand in self.known:
+                return cand
+        return None
+
+    def resolve(self, from_rel: str, spec: str) -> Optional[str]:
+        """Resolve a specifier to a known file's relative path, or None for
+        bare package specifiers, absolute paths and unknown files."""
+        if spec.startswith(("./", "../")) or spec in (".", ".."):
+            return self._try(posixpath.normpath(posixpath.join(posixpath.dirname(from_rel), spec)))
+        if spec.startswith("/") or spec.startswith("node:"):
+            return None
+        for al in self.aliases:
+            root = posixpath.normpath(posixpath.join(al.base_dir, al.base_url or ".")) if (al.base_dir or al.base_url) else "."
+            for pattern, targets in al.paths:
+                captured = _alias_capture(pattern, spec)
+                if captured is None:
+                    continue
+                for target in targets:
+                    cand = target.replace("*", captured, 1) if "*" in target else target
+                    hit = self._try(posixpath.normpath(posixpath.join(root, cand)))
+                    if hit:
+                        return hit
+            if al.base_url is not None:
+                hit = self._try(posixpath.normpath(posixpath.join(root, spec)))
+                if hit:
+                    return hit
+        return None
+
 
 # --------------------------------------------------------------------------
 # Python AST analysis
@@ -1895,6 +2074,7 @@ class ModuleRecord:
     rel: str
     is_package: bool
     imports: List[ImportRecord] = dataclasses.field(default_factory=list)
+    layer_name: str = ""  # dotted name used for layer / forbidden-import matching (defaults to name)
 
 
 class ScopeUsage:
@@ -2591,12 +2771,15 @@ class ModuleGraph:
         self.config = config
         self.emit = emit
         self.known: Set[str] = set(self.records)
+        self.layer_names: Dict[str, str] = {n: (r.layer_name or n) for n, r in self.records.items()}
         self.hard: Dict[str, Set[str]] = collections.defaultdict(set)
         self.all: Dict[str, Set[str]] = collections.defaultdict(set)
         self.edge_info: Dict[Tuple[str, str], ImportRecord] = {}
 
     def _resolve_candidates(self, rec: ModuleRecord, imp: ImportRecord) -> List[str]:
         targets: List[str] = []
+        if imp.level < 0:  # pre-resolved edge (JS/TS graph)
+            return [imp.module] if imp.module in self.known else []
         if imp.level == 0 and not imp.names:
             # import a.b.c -> longest known prefix
             parts = (imp.module or "").split(".")
@@ -2687,23 +2870,25 @@ class ModuleGraph:
         if not layers and not forbidden:
             return
         for src in sorted(self.all):
-            src_parts = src.split(".")
-            src_layer = _layer_of(src, layers) if layers else None
+            lsrc = self.layer_names[src]
+            src_parts = lsrc.split(".")
+            src_layer = _layer_of(lsrc, layers) if layers else None
             for dst in sorted(self.all[src]):
                 if dst == src:
                     continue
                 imp = self.edge_info[(src, dst)]
                 rec = self.records[src]
-                dst_parts = dst.split(".")
+                ldst = self.layer_names[dst]
+                dst_parts = ldst.split(".")
                 if src_layer is not None:
-                    dst_layer = _layer_of(dst, layers)
+                    dst_layer = _layer_of(ldst, layers)
                     if dst_layer is not None and dst_layer < src_layer:
                         self.emit(Finding("RS-ARCH-002", RULES["RS-ARCH-002"].severity, "high", rec.rel, imp.lineno,
                                           imp.col, "Layer '%s' must not import layer '%s' (%s -> %s)"
                                           % (layers[src_layer], layers[dst_layer], src, dst), imp.snippet,
                                           RULES["RS-ARCH-002"].remediation))
                 for rule in forbidden:
-                    if _module_matches(src, src_parts, rule["from"]) and _module_matches(dst, dst_parts, rule["to"]):
+                    if _module_matches(lsrc, src_parts, rule["from"]) and _module_matches(ldst, dst_parts, rule["to"]):
                         self.emit(Finding("RS-ARCH-002", RULES["RS-ARCH-002"].severity, "high", rec.rel, imp.lineno,
                                           imp.col, "Forbidden import: '%s' must not import '%s' (%s -> %s)"
                                           % (rule["from"], rule["to"], src, dst), imp.snippet,
@@ -2753,6 +2938,9 @@ class Scanner:
         self.suppressed = 0
         self.scanned = 0
         self.modules: List[ModuleRecord] = []
+        self.js_modules: List[JsModule] = []
+        self.js_aliases: List[JsPathAliases] = []
+        self.js_known: Set[str] = set()
         self._directives: Dict[str, Dict[int, Set[str]]] = {}
         self._seen: Set[Tuple[str, str, int, int, str]] = set()
         self._current: Optional[SourceFile] = None
@@ -2798,6 +2986,8 @@ class Scanner:
         self._current = None
         if self.modules and ("RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled):
             ModuleGraph(self.modules, self.config, self._emit).report()
+        if self.js_modules and ("RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled):
+            self._report_js_graph()
         self.findings.sort(key=Finding.sort_key)
         return ScanResult(self.findings, self.scanned, self.warnings, self.suppressed, self.indents)
 
@@ -2828,6 +3018,13 @@ class Scanner:
         if decode_error is not None:
             self._sys_finding(entry.rel, 1, "File is not valid UTF-8 (%s); scanned with replacement characters"
                               % decode_error.reason)
+        base_name = os.path.basename(entry.rel).lower()
+        if base_name in ("tsconfig.json", "jsconfig.json"):
+            aliases = load_js_path_aliases(entry.rel, text, self.warnings)
+            if aliases is not None:
+                self.js_aliases.append(aliases)
+        if lang == "js":
+            self.js_known.add(entry.rel)
         entropy_enabled = ("RS-SEC-002" in self.enabled and not is_lockfile(entry.rel)
                            and not is_minified(entry.rel, sf.lines))
         if "RS-SEC-001" in self.enabled or entropy_enabled:
@@ -2866,6 +3063,30 @@ class Scanner:
         analyzer.run_quality()
         if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
             scan_pattern_sinks(sf, self._emit, analyzer.masked)
+        if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
+            self.js_modules.append(JsModule(sf.rel, analyzer.collect_imports()))
+
+    def _report_js_graph(self) -> None:
+        """Build the JS/TS module graph from pre-resolved edges and reuse the
+        Python cycle / layer reporting."""
+        resolver = JsModuleResolver(self.js_known, self.js_aliases)
+        roots = self.config.package_roots
+        name_of = {rel: js_module_name(rel) for rel in self.js_known}
+        records: List[ModuleRecord] = []
+        with_record: Set[str] = set()
+        for jm in self.js_modules:
+            name = name_of[jm.rel]
+            rec = ModuleRecord(name, jm.rel, False, [], js_layer_name(name, roots))
+            for imp in jm.imports:
+                target = resolver.resolve(jm.rel, imp.specifier)
+                if target is None or target not in name_of:
+                    continue
+                rec.imports.append(ImportRecord(name_of[target], [], -1, imp.lineno, imp.col, imp.soft, imp.snippet))
+            records.append(rec)
+            with_record.add(jm.rel)
+        for rel in sorted(self.js_known - with_record):
+            records.append(ModuleRecord(name_of[rel], rel, False, [], js_layer_name(name_of[rel], roots)))
+        ModuleGraph(records, self.config, self._emit).report()
 
 
 def scan(root: str, config: Optional[Config] = None, rules: Optional[Set[str]] = None,
@@ -4195,6 +4416,76 @@ class TestJsStructure(_ProjectMixin, unittest.TestCase):
         src = "function big(x) {\n%s  return -1;\n}\n" % branches
         findings = self.scan_files({"big.test.js": src, "__tests__/other.js": src, "src/big.js": src})
         self.assertEqual([f.file for f in self.by_rule(findings, "RS-QUAL-001")], ["src/big.js"])
+
+
+class TestJsImportGraph(_ProjectMixin, unittest.TestCase):
+    def test_three_module_cycle_reported_once_with_path(self):
+        files = {"a.ts": "import { b } from './b';\nexport const a = 1;\n",
+                 "b.ts": "import { c } from './c';\nexport const b = 2;\n",
+                 "c.ts": "import { a } from './a';\nexport const c = 3;\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].severity, "high")
+        self.assertEqual(cycles[0].file, "a.ts")
+        self.assertEqual(cycles[0].line, 1)
+        self.assertIn("a -> b -> c -> a", cycles[0].message)
+
+    def test_js_extension_resolves_to_ts_and_index_import(self):
+        files = {"main.ts": "import { x } from './x.js';\n", "x.ts": "import './main';\n",
+                 "app.ts": "import u from './utils';\n", "utils/index.ts": "import '../app';\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        messages = sorted(c.message for c in cycles)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("app -> utils/index -> app", messages[0])
+        self.assertIn("main -> x -> main", messages[1])
+
+    def test_tsconfig_paths_alias_and_malformed_config(self):
+        tsconfig = ('{\n  // comment\n  "compilerOptions": {\n    "baseUrl": ".",\n'
+                    '    "paths": { "@/*": ["src/*"], },\n  },\n}\n')
+        files = {"tsconfig.json": tsconfig, "src/a.ts": "import b from '@/b';\n", "src/b.ts": "import a from '@/a';\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertIn("src/a -> src/b -> src/a", cycles[0].message)
+        root = self.make_project({"jsconfig.json": "{ not json at all", "a.js": "import './b';\n", "b.js": "import './a';\n"})
+        result = scan(root)
+        self.assertTrue(any("jsconfig.json" in w for w in result.warnings))
+        self.assertEqual(len(self.by_rule(result.findings, "RS-ARCH-001")), 1)
+
+    def test_type_only_dynamic_and_function_level_imports_are_soft(self):
+        files = {"a.ts": "import type { B } from './b';\nexport class A {}\n", "b.ts": "import { A } from './a';\nexport class B {}\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual([c.severity for c in cycles], ["low"])
+        self.assertIn("soft", cycles[0].message)
+        files = {"a.js": "const b = require('./b');\n", "b.js": "async function f() { const a = await import('./a'); return a; }\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual([c.severity for c in cycles], ["low"])
+        files = {"a.js": "const b = require('./b');\n", "b.js": "function f() { return require('./a'); }\n"}
+        self.assertEqual([c.severity for c in self.by_rule(self.scan_files(files), "RS-ARCH-001")], ["low"])
+
+    def test_self_import_bare_packages_and_comments(self):
+        files = {"s.ts": "import './s';\n",
+                 "ok.ts": "import React from 'react';\nimport fs from 'node:fs';\nconst _ = require('lodash');\n"
+                          "// import x from './s'\nconst t = \"import y from './s'\";\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].file, "s.ts")
+        self.assertIn("Self-import", cycles[0].message)
+
+    def test_long_chain_on_disk(self):
+        n = 5000
+        files = {"m%d.js" % i: "import './m%d';\n" % (i + 1) for i in range(n - 1)}
+        files["m%d.js" % (n - 1)] = "export const x = 1;\n"
+        self.assertEqual(self.by_rule(self.scan_files(files), "RS-ARCH-001"), [])
+
+    def test_layers_and_forbidden_imports(self):
+        files = {"src/api/routes.ts": "import { Model } from '../domain/models';\n",
+                 "src/domain/models.ts": "import { routes } from '../api/routes';\n"}
+        findings = self.scan_files(files, {"layers": ["api", "service", "domain"]})
+        layer = self.by_rule(findings, "RS-ARCH-002")
+        self.assertEqual([(f.file, f.line) for f in layer], [("src/domain/models.ts", 1)])
+        self.assertIn("'domain' must not import layer 'api'", layer[0].message)
+        findings = self.scan_files(files, {"forbidden_imports": [{"from": "domain", "to": "api"}]})
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-ARCH-002")], ["src/domain/models.ts"])
 
 
 if __name__ == "__main__":
