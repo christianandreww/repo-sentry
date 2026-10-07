@@ -1015,7 +1015,10 @@ def _sev_for_arg(constant: bool) -> str:
 def scan_pattern_sinks(sf: SourceFile, emit) -> None:
     """RS-SEC-003 / RS-SEC-004 for non-Python languages. Pattern-based,
     confidence is low or medium by design."""
-    stripped = strip_comments(sf.text, sf.lang).splitlines()
+    if sf.lang == "js":
+        stripped = js_mask(sf.text, jsx=js_allows_jsx(sf.rel)).splitlines()
+    else:
+        stripped = strip_comments(sf.text, sf.lang).splitlines()
     rem3 = RULES["RS-SEC-003"].remediation
     rem4 = RULES["RS-SEC-004"].remediation
     file_text = sf.text
@@ -1104,6 +1107,269 @@ def scan_pattern_sinks(sf: SourceFile, emit) -> None:
             for m in SH_RCE_RE.finditer(line):
                 emit(Finding("RS-SEC-003", "critical", "low", sf.rel, lineno, m.start() + 1,
                              "sh -c with variable interpolation", sf.snippet(lineno), rem3))
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: lexical masking (foundation for all JS/TS rules)
+# --------------------------------------------------------------------------
+# Identifiers after which a `/` starts a regex literal rather than a division.
+_JS_REGEX_KEYWORDS = frozenset((
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case",
+    "do", "else", "yield", "await", "extends", "export", "default",
+))
+_JS_EXPR_CHUNK_RE = re.compile(r"[^'\"`/{}<]+")
+_JS_JSX_TEXT_CHUNK_RE = re.compile(r"[^<{\r\n]+")
+_JS_JSX_TAG_CHUNK_RE = re.compile(r"[^'\"{}<>/]+")
+_JS_TPL_CHUNK_RE = re.compile(r"[^`$\\\r\n]+")
+_JS_JSX_TAG_RE = re.compile(r"<(>|[A-Za-z_$][\w$.:\-]*)")
+_JS_NOT_NEWLINE_RE = re.compile(r"[^\r\n]")
+
+
+def _js_prev_is_value(text: str, last: int) -> bool:
+    """True when the last significant code character ends a value (so a
+    following `/` is a division), False when an operand is expected (regex)."""
+    if last < 0:
+        return False
+    ch = text[last]
+    if ch in ")]}":
+        return True
+    if ch.isalnum() or ch in "_$":
+        k = last
+        while k > 0 and (text[k - 1].isalnum() or text[k - 1] in "_$"):
+            k -= 1
+        word = text[k:last + 1]
+        if word[0].isdigit():
+            return True
+        return word not in _JS_REGEX_KEYWORDS
+    return False
+
+
+def _js_looks_like_jsx(text: str, i: int) -> bool:
+    """Cheap JSX heuristic at a `<` in expression position: `<>`, or `<Tag`
+    followed by `>`, `/`, `{`, an attribute name or a line break. `<T,>`,
+    `a < b` and `Array<string>` are rejected."""
+    m = _JS_JSX_TAG_RE.match(text, i)
+    if not m:
+        return False
+    if m.group(1) == ">":
+        return True
+    k = m.end()
+    n = len(text)
+    while k < n and text[k] in " \t\r\n":
+        k += 1
+    if k >= n:
+        return True
+    nxt = text[k]
+    return nxt in ">/{" or nxt.isalpha() or nxt in "_$"
+
+
+def js_allows_jsx(rel: str) -> bool:
+    """JSX is possible in .js/.jsx/.mjs/.cjs/.tsx; plain .ts/.mts/.cts use
+    `<Type>value` assertions instead, so JSX detection is off there."""
+    return os.path.splitext(rel)[1].lower() not in (".ts", ".mts", ".cts")
+
+
+def js_mask(text: str, jsx: bool = True) -> str:
+    """Return `text` with the contents of comments, string literals, template
+    literal text, regex literals and JSX text replaced by spaces. Length and
+    every line break are preserved exactly; delimiters (quotes, backticks,
+    regex slashes, `${` `}`) are kept. Code inside `${ ... }` stays visible
+    and is masked recursively. Never raises; an unterminated template,
+    comment or JSX element is masked to the end of the file, an unterminated
+    string or regex to the end of its line. Linear time."""
+    n = len(text)
+    out = list(text)
+
+    def blank(a: int, b: int) -> None:
+        if b > a:
+            out[a:b] = list(_JS_NOT_NEWLINE_RE.sub(" ", text[a:b]))
+
+    # context stack entries: ["expr", brace_depth] | ["tpl"] | ["jsx", element_depth, mode]
+    stack: List[List[object]] = [["expr", 0]]
+    i = 0
+    last = -1  # index of the last significant (unmasked, non-space) code character
+    while i < n:
+        ctx = stack[-1]
+        kind = ctx[0]
+        c = text[i]
+        if kind == "tpl":
+            if c == "`":
+                stack.pop()
+                last = i
+                i += 1
+            elif c == "\\":
+                blank(i, min(n, i + 2))
+                i += 2
+            elif c == "$" and i + 1 < n and text[i + 1] == "{":
+                stack.append(["expr", 0])
+                i += 2
+            elif c in "\r\n":
+                i += 1
+            else:
+                m = _JS_TPL_CHUNK_RE.match(text, i)
+                j = m.end() if m else i + 1
+                blank(i, j)
+                i = j
+            continue
+        if kind == "jsx":
+            mode = ctx[2]
+            if mode == "text":
+                if c == "{":
+                    stack.append(["expr", 0])
+                    i += 1
+                elif c == "<":
+                    if text.startswith("</", i):
+                        ctx[2] = "close"
+                        i += 2
+                    else:
+                        ctx[2] = "tag"
+                        i += 1
+                elif c in "\r\n":
+                    i += 1
+                else:
+                    m = _JS_JSX_TEXT_CHUNK_RE.match(text, i)
+                    j = m.end() if m else i + 1
+                    blank(i, j)
+                    i = j
+                continue
+            if mode == "close":
+                j = text.find(">", i)
+                if j == -1:
+                    j = n - 1
+                i = j + 1
+                ctx[1] = int(ctx[1]) - 1  # type: ignore[call-overload]
+                if int(ctx[1]) <= 0:  # type: ignore[call-overload]
+                    stack.pop()
+                    last = j
+                else:
+                    ctx[2] = "text"
+                continue
+            # mode == "tag": inside `<Tag ... >`
+            if c in "'\"":
+                j = i + 1
+                while j < n and text[j] != c:
+                    j += 1
+                blank(i + 1, j)
+                i = j + 1
+            elif c == "{":
+                stack.append(["expr", 0])
+                i += 1
+            elif c == "/" and i + 1 < n and text[i + 1] == ">":
+                i += 2
+                if int(ctx[1]) <= 0:  # type: ignore[call-overload]
+                    stack.pop()
+                    last = i - 1
+                else:
+                    ctx[2] = "text"
+            elif c == ">":
+                i += 1
+                ctx[1] = int(ctx[1]) + 1  # type: ignore[call-overload]
+                ctx[2] = "text"
+            elif c in "<}/":
+                i += 1
+            else:
+                m = _JS_JSX_TAG_CHUNK_RE.match(text, i)
+                i = m.end() if m else i + 1
+            continue
+        # kind == "expr"
+        if c == "'" or c == '"':
+            j = i + 1
+            while j < n:
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == c or ch == "\n" or ch == "\r":
+                    break
+                j += 1
+            if j >= n:
+                blank(i + 1, n)
+                i = n
+            elif text[j] == c:
+                blank(i + 1, j)
+                last = j
+                i = j + 1
+            else:  # unterminated string: masked to the end of its line
+                blank(i + 1, j)
+                last = j - 1
+                i = j
+        elif c == "`":
+            stack.append(["tpl"])
+            i += 1
+        elif c == "/":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt == "/":
+                j = text.find("\n", i)
+                if j == -1:
+                    j = n
+                blank(i, j)
+                i = j
+            elif nxt == "*":
+                j = text.find("*/", i + 2)
+                j = n if j == -1 else j + 2
+                blank(i, j)
+                i = j
+            elif _js_prev_is_value(text, last):
+                last = i
+                i += 1
+            else:  # regex literal
+                j = i + 1
+                in_class = False
+                while j < n:
+                    ch = text[j]
+                    if ch == "\\":
+                        j += 2
+                        continue
+                    if ch == "\n" or ch == "\r":
+                        break
+                    if in_class:
+                        if ch == "]":
+                            in_class = False
+                    elif ch == "[":
+                        in_class = True
+                    elif ch == "/":
+                        break
+                    j += 1
+                if j < n and text[j] == "/":
+                    blank(i + 1, j)
+                    k = j + 1
+                    while k < n and (text[k].isalpha() or text[k] in "_$"):
+                        k += 1
+                    last = k - 1
+                    i = k
+                else:
+                    j = min(j, n)
+                    blank(i + 1, j)
+                    last = j - 1
+                    i = j
+        elif c == "{":
+            ctx[1] = int(ctx[1]) + 1  # type: ignore[call-overload]
+            last = i
+            i += 1
+        elif c == "}":
+            if int(ctx[1]) > 0:  # type: ignore[call-overload]
+                ctx[1] = int(ctx[1]) - 1  # type: ignore[call-overload]
+                last = i
+            elif len(stack) > 1:
+                stack.pop()
+            else:
+                last = i
+            i += 1
+        elif c == "<":
+            if jsx and not _js_prev_is_value(text, last) and _js_looks_like_jsx(text, i):
+                stack.append(["jsx", 0, "tag"])
+                i += 1
+            else:
+                last = i
+                i += 1
+        else:
+            m = _JS_EXPR_CHUNK_RE.match(text, i)
+            j = m.end() if m else i + 1
+            stripped = text[i:j].rstrip()
+            if stripped:
+                last = i + len(stripped) - 1
+            i = j
+    return "".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -3358,6 +3624,105 @@ class TestRobustness(_ProjectMixin, unittest.TestCase):
         self.assertTrue(gi.is_ignored("root_only.txt", False))
         self.assertFalse(gi.is_ignored("sub/root_only.txt", False))
         self.assertTrue(gi.is_ignored("docs/a/b/c.md", False))
+
+
+class TestJsMasking(_ProjectMixin, unittest.TestCase):
+    TRICKY = [
+        "const r = /[/]x\\/y/g; const d = (a + b) / 2 / c; var s = a / b / c;\n",
+        "const x = (a) / 2;\nconst re = x.replace(/\\/+/g, '/');\n",
+        "const t = `a ${b ? `c ${d ? `e ${f}` : 'g'}` : 'h'} i`;\nnext();\n",
+        "function App() {\n  return <p className='x'>don't {name} won't</p>;\n}\nconst y = exec(cmd);\n",
+        "const s = 'unterminated\nconst after = eval(z);\n",
+        "const a: Array<string> = []; if (a < b > c) {} const m = new Map<string, number>();\nrun(x);\n",
+    ]
+
+    def test_comments_strings_and_templates_are_masked(self):
+        src = "// eval(x)\nconst s = \"exec(cmd)\";\nconst t = `eval(x)`;\nconst u = `pre ${eval(y)} post`;\n"
+        masked = js_mask(src)
+        self.assertEqual(len(masked), len(src))
+        self.assertNotIn("eval(x)", masked)
+        self.assertNotIn("exec(cmd)", masked)
+        self.assertIn("eval(y)", masked)
+        self.assertIn('"', masked)
+        self.assertIn("`", masked)
+        self.assertEqual([i for i, ch in enumerate(masked) if ch == "\n"], [i for i, ch in enumerate(src) if ch == "\n"])
+
+    def test_length_and_newlines_preserved_on_tricky_inputs(self):
+        for src in self.TRICKY:
+            masked = js_mask(src)
+            self.assertEqual(len(masked), len(src), src)
+            self.assertEqual([i for i, ch in enumerate(masked) if ch == "\n"],
+                             [i for i, ch in enumerate(src) if ch == "\n"], src)
+            crlf = src.replace("\n", "\r\n")
+            masked_crlf = js_mask(crlf)
+            self.assertEqual(len(masked_crlf), len(crlf))
+            self.assertEqual(masked_crlf.count("\r\n"), crlf.count("\r\n"))
+
+    def test_regex_versus_division(self):
+        masked = js_mask(self.TRICKY[0])
+        self.assertNotIn("[/]x", masked)
+        self.assertIn("(a + b) / 2 / c", masked)
+        self.assertIn("a / b / c", masked)
+        masked = js_mask(self.TRICKY[1])
+        self.assertIn("(a) / 2", masked)
+        self.assertIn("x.replace(/", masked)
+        self.assertNotIn("\\/+", masked)
+        masked = js_mask("const n = total / count;\nreturn /ab+c/i.test(s) ? 1 : 2;\n")
+        self.assertIn("total / count", masked)
+        self.assertNotIn("ab+c", masked)
+        self.assertIn(".test(s)", masked)
+
+    def test_nested_templates_three_deep(self):
+        masked = js_mask(self.TRICKY[2])
+        self.assertEqual(masked, "const t = `  ${b ? `  ${d ? `  ${f}` : ' '}` : ' '}  `;\nnext();\n")
+
+    def test_jsx_with_apostrophes_and_generics(self):
+        masked = js_mask(self.TRICKY[3])
+        self.assertNotIn("don't", masked)
+        self.assertNotIn("won't", masked)
+        self.assertIn("{name}", masked)
+        self.assertIn("exec(cmd)", masked)
+        tsx = ("const items: Array<string> = [];\nfunction List<T,>(props: { rows: T[] }) {\n"
+               "  return (\n    <ul className=\"list\">\n      {props.rows.map((r) => <li key={String(r)}>it's {r} here</li>)}\n"
+               "    </ul>\n  );\n}\nif (a < b && c > d) { exec(cmd); }\nconst m = new Map<string, number>();\n")
+        masked = js_mask(tsx)
+        self.assertEqual(len(masked), len(tsx))
+        self.assertNotIn("it's", masked)
+        self.assertIn("Array<string>", masked)
+        self.assertIn("exec(cmd)", masked)
+        self.assertIn("new Map<string, number>()", masked)
+        self.assertIn("String(r)", masked)
+        plain_ts = js_mask("const v = <any>obj;\nconst w = a < b;\nexec(cmd);\n", jsx=False)
+        self.assertIn("exec(cmd)", plain_ts)
+
+    def test_unterminated_constructs_do_not_derail(self):
+        masked = js_mask(self.TRICKY[4])
+        self.assertIn("eval(z)", masked)
+        masked = js_mask("const t = `never closed\nexec(a);\n")
+        self.assertNotIn("exec(a)", masked)
+        self.assertEqual(len(masked), len("const t = `never closed\nexec(a);\n"))
+        masked = js_mask("/* never closed\nexec(a);\n")
+        self.assertNotIn("exec(a)", masked)
+        masked = js_mask("const r = /never closed\nexec(a);\n")
+        self.assertIn("exec(a)", masked)
+        self.assertEqual(js_mask(""), "")
+
+    def test_masking_is_fast_on_pathological_input(self):
+        import time as _time
+        big_parens = "f" + "(" * 200000 + ")" * 200000 + ";\n"
+        one_line = "var x = 1;" + " a = a + 1;" * 100000 + "\n"
+        tpl = "const t = `" + "${" * 20000 + "x" + "}" * 20000 + "`;\n"
+        started = _time.time()
+        for src in (big_parens, one_line, tpl, "a" * 1000000):
+            masked = js_mask(src)
+            self.assertEqual(len(masked), len(src))
+        self.assertLess(_time.time() - started, 5.0)
+
+    def test_masked_sinks_ignore_comments_and_strings(self):
+        src = ("// eval(x)\nconst s = \"eval(x)\";\nconst t = `eval(x)`;\nconst u = `${eval(y)}`;\neval(x);\n")
+        findings = self.scan_files({"a.js": src})
+        lines = sorted(f.line for f in self.by_rule(findings, "RS-SEC-004"))
+        self.assertEqual(lines, [4, 5])
 
 
 if __name__ == "__main__":
