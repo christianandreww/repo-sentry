@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -248,8 +248,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "entropy_base64": 4.5,
     "min_secret_length": 20,
 }
-DEFAULT_IGNORE_DIRS: List[str] = [".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build"]
-DEFAULT_IGNORE_GLOBS: List[str] = ["*.min.js", "*.lock"]
+DEFAULT_IGNORE_DIRS: List[str] = [".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
+                                  "coverage", ".next", ".nuxt", "out"]
+DEFAULT_IGNORE_GLOBS: List[str] = ["*.min.js", "*.min.css", "*.map", "*.lock"]
 DEFAULT_PACKAGE_ROOTS: List[str] = ["src", "."]
 CONFIG_KEYS = {
     "ignore_dirs", "ignore_globs", "respect_gitignore", "thresholds", "severity_overrides",
@@ -3069,7 +3070,7 @@ class Scanner:
         self.js_aliases: List[JsPathAliases] = []
         self.js_known: Set[str] = set()
         self._directives: Dict[str, Dict[int, Set[str]]] = {}
-        self._seen: Set[Tuple[str, str, int, int, str]] = set()
+        self._seen: Set[Tuple[str, str, int, int]] = set()
         self._current: Optional[SourceFile] = None
         self.indents: Dict[Tuple[str, int], int] = {}
 
@@ -3093,8 +3094,8 @@ class Scanner:
                 if ids and ("*" in ids or finding.rule_id in ids):
                     self.suppressed += 1
                     return
-        key = (finding.rule_id, finding.file, finding.line, finding.col, finding.message)
-        if key in self._seen:
+        key = (finding.rule_id, finding.file, finding.line, finding.col)
+        if key in self._seen:  # never report the same (rule, file, line, col) twice
             return
         self._seen.add(key)
         self.findings.append(finding)
@@ -4706,6 +4707,127 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("RS-SEC-006", out)
         self.assertIn("JS/TS: pattern-based, approximate", out)
+
+
+class TestJsRobustnessAndCli(_ProjectMixin, unittest.TestCase):
+    AWS = "AKIA" + "J7Q2M9X4L1P8R6T3"
+
+    def test_secret_in_js_comment_detected_and_redacted(self):
+        root = self.make_project({"a.js": "// key: %s\nconst x = 1;\n" % self.AWS,
+                                  "b.js": "const t = `%s`;\n" % self.AWS})
+        result = scan(root)
+        hits = self.by_rule(result.findings, "RS-SEC-001")
+        self.assertEqual(sorted(f.file for f in hits), ["a.js", "b.js"])
+        self.assertTrue(all(f.severity == "critical" for f in hits))
+        for rendered in (render_terminal(result.findings, 2, "high", False), render_json(result.findings, 2, "high"),
+                         render_markdown(result.findings, 2, "high"), self.run_cli([root])[1],
+                         self.run_cli([root, "--format", "json"])[1], self.run_cli([root, "--format", "markdown"])[1]):
+            self.assertNotIn(self.AWS, rendered)
+            self.assertIn("AKIA****[len=20]", rendered)
+
+    def test_rules_ignore_override_suppression_and_baseline(self):
+        src = TestJsSecurity.SEC006
+        root = self.make_project({"server.js": src})
+        code, out, _ = self.run_cli([root, "--rules", "RS-SEC-006", "--format", "json"])
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertEqual({f["rule_id"] for f in data["findings"]}, {"RS-SEC-006"})
+        self.assertEqual(len(data["findings"]), 9)
+        code, out, _ = self.run_cli([root, "--ignore-rules", "RS-SEC-006", "--format", "json"])
+        self.assertNotIn("RS-SEC-006", {f["rule_id"] for f in json.loads(out)["findings"]})
+        findings = self.scan_files({"server.js": src}, {"severity_overrides": {"RS-SEC-006": "low"}})
+        self.assertTrue(all(f.severity == "low" for f in self.by_rule(findings, "RS-SEC-006")))
+        suppressed = src.replace("rejectUnauthorized: false });", "rejectUnauthorized: false }); // reposentry: ignore RS-SEC-006")
+        findings = self.scan_files({"server.js": suppressed})
+        self.assertNotIn(4, [f.line for f in self.by_rule(findings, "RS-SEC-006")])
+        baseline = os.path.join(root, "baseline.json")
+        self.assertEqual(self.run_cli([root, "--rules", "RS-SEC-006", "--write-baseline", baseline])[0], 1)
+        code, out, _ = self.run_cli([root, "--rules", "RS-SEC-006", "--baseline", baseline, "--format", "json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["summary"]["total"], 0)
+
+    def test_json_identical_across_runs_and_crlf(self):
+        files = {"a.ts": "import { b } from './b';\nfunction f(x) {\n  if (x) { eval(x); }\n  try { g(); } catch (e) {}\n}\n",
+                 "b.ts": "import { a } from './a';\nexport const b = 1;\n"}
+        root_lf = self.make_project(files)
+        root_crlf = self.make_project({k: v.replace("\n", "\r\n") for k, v in files.items()})
+        out1 = self.run_cli([root_lf, "--format", "json"])[1]
+        out2 = self.run_cli([root_lf, "--format", "json"])[1]
+        out3 = self.run_cli([root_crlf, "--format", "json"])[1]
+        self.assertEqual(out1, out2)
+        self.assertEqual(out1, out3)
+        findings = json.loads(out1)["findings"]
+        self.assertEqual(sorted((f["rule_id"], f["file"], f["line"]) for f in findings),
+                         [("RS-ARCH-001", "a.ts", 1), ("RS-QUAL-004", "a.ts", 4), ("RS-SEC-004", "a.ts", 3)])
+
+    def test_pathological_inputs_finish_quickly(self):
+        import time as _time
+        files = {"parens.js": "f" + "(" * 200000 + ")" * 200000 + ";\n",
+                 "oneline.js": "var x = 1;" + " x = x + 1;" * 90000 + "\n",
+                 "template.js": "const t = `never closed ${a + b\nfunction f() { if (x) { eval(x); } }\n",
+                 "binary.js": b"\x00\x01\x02eval(x)\n",
+                 "braces.js": "{" * 100000 + "}" * 100000 + "\n"}
+        root = self.make_project(files)
+        started = _time.time()
+        result = scan(root)
+        self.assertLess(_time.time() - started, 5.0)
+        self.assertEqual(self.by_rule(result.findings, "RS-SYS-001"), [])
+        self.assertEqual(result.scanned_files, 4)
+
+    def test_untokenizable_file_yields_sys_finding_and_scan_continues(self):
+        from unittest import mock
+        root = self.make_project({"bad.js": "const a = 1;\n", "good.js": "eval(x);\n"})
+        original = js_mask
+
+        def boom(text, jsx=True):
+            if "const a" in text:
+                raise ValueError("synthetic tokenizer failure")
+            return original(text, jsx)
+
+        with mock.patch.dict(globals(), {"js_mask": boom}):
+            findings = scan(root).findings
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-SYS-001")], ["bad.js"])
+        self.assertEqual(self.by_rule(findings, "RS-SYS-001")[0].severity, "low")
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-SEC-004")], ["good.js"])
+
+    def test_declaration_minified_and_ignored_dirs_skipped(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return eval(x);\n}\n" % branches
+        files = {"types.d.ts": src, "bundle.min.js": src, "app.js.map": "{\"mappings\": \"%s\"}\n" % ("AAAA" * 30),
+                 "coverage/lcov.js": src, ".next/x.js": src, "out/y.js": src, "src/real.js": src,
+                 "packed.js": "var a=1;" + "a=a+1;" * 400 + "eval(x);\n"}
+        root = self.make_project(files)
+        result = scan(root)
+        self.assertEqual({f.file for f in result.findings}, {"src/real.js"})
+        self.assertEqual({f.rule_id for f in result.findings}, {"RS-QUAL-001", "RS-SEC-004"})
+
+    def test_dogfood_express_project(self):
+        branches = "".join("  if (kind === %d) { return %d; }\n" % (i, i) for i in range(25))
+        files = {
+            "package.json": '{"name": "demo", "dependencies": {"express": "^4.18.0"}}\n',
+            "app.js": ("const express = require('express');\nconst routes = require('./routes');\n"
+                       "const config = require('./config');\nconst app = express();\napp.use(routes);\n"
+                       "app.listen(config.port);\n"),
+            "config.js": "module.exports = { port: 3000, name: 'demo' };\n",
+            "routes.js": ("const { exec } = require('child_process');\nconst { Router } = require('express');\n"
+                          "const { helper } = require('./utils');\nconst router = Router();\n"
+                          "router.get('/run', (req, res) => {\n  exec(req.query.cmd, (err, out) => res.send(helper(out)));\n});\n"
+                          "module.exports = router;\n"),
+            "utils.js": ("const routes = require('./routes');\nfunction classify(kind) {\n%s  return -1;\n}\n"
+                         "function helper(out) { return String(out); }\nmodule.exports = { classify, helper, routes };\n" % branches),
+            "db.js": ("const { connect } = require('./config');\nasync function init() {\n  try {\n    await connect();\n"
+                      "  } catch (e) {}\n}\nmodule.exports = { init };\n"),
+            "middleware/auth.js": ("module.exports = function auth(req, res, next) {\n  if (!req.headers.authorization) {\n"
+                                   "    return res.status(401).end();\n  }\n  next();\n};\n"),
+        }
+        findings = self.scan_files(files)
+        self.assertEqual(sorted({(f.rule_id, f.file) for f in findings}),
+                         [("RS-ARCH-001", "routes.js"), ("RS-QUAL-001", "utils.js"), ("RS-QUAL-004", "db.js"),
+                          ("RS-SEC-003", "routes.js")])
+        self.assertEqual(len(findings), 4)
+        sec = self.by_rule(findings, "RS-SEC-003")[0]
+        self.assertEqual((sec.severity, sec.line), ("critical", 6))
+        self.assertIn("routes -> utils -> routes", self.by_rule(findings, "RS-ARCH-001")[0].message)
 
 
 if __name__ == "__main__":
