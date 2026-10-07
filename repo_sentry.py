@@ -168,6 +168,18 @@ for _r in (
          "Rotate the credential immediately; rewriting history (git filter-repo / BFG) is optional and "
          "only helps if no one has cloned the repo.",
          "all"),
+    Rule("RS-SEC-006", "Insecure configuration (JS/TS)", "medium", "security",
+         "JS/TS: pattern-based, approximate. TLS verification disabled (rejectUnauthorized: false, "
+         "NODE_TLS_REJECT_UNAUTHORIZED='0') [high]; createHash('md5'|'sha1') [medium; fine for non-security "
+         "checksums]; Math.random() near token/secret/password/nonce/session/csrf/otp identifiers [medium]; "
+         "JWT algorithms containing 'none' [high]; CORS origin '*' with credentials: true [medium]; "
+         "dangerouslySetInnerHTML with non-constant __html [high] (constant: low); fs paths built from "
+         "req/params/query/body/argv [medium, low confidence]; new RegExp() from request data [low]. "
+         "Severity is downgraded one level in test files.",
+         "Keep TLS verification on, hash credentials with bcrypt/scrypt/argon2, generate secrets with "
+         "crypto.randomBytes, pin JWT algorithms, avoid wildcard CORS with credentials, sanitize HTML, "
+         "and validate user-controlled paths and patterns.",
+         "js"),
     Rule("RS-SYS-001", "File could not be parsed", "low", "system",
          "The file could not be read, decoded or parsed (SyntaxError, encoding error). "
          "The scan continues; the file is still pattern-scanned for secrets.",
@@ -994,7 +1006,7 @@ def _is_literal_arg(arg: str) -> bool:
     return True
 
 
-JS_EXEC_RE = re.compile(r"(?<![\w$.])(?:(?:child_process|cp|childProcess|proc)\s*\.\s*)?(exec|execSync)\s*\(")
+JS_EXEC_RE = re.compile(r"(?<![\w$.])(?:(?:child_process|cp|childProcess|proc|sh|shell|shelljs|execa)\s*\.\s*)?(exec|execSync)\s*\(")
 JS_EXEC_MEMBER_RE = re.compile(r"\.\s*(exec|execSync)\s*\(")
 JS_SPAWN_RE = re.compile(r"(?<![\w$.])(spawn|spawnSync|execFile|execFileSync)\s*\(")
 JS_EVAL_RE = re.compile(r"(?<![\w$.])eval\s*\(")
@@ -1026,7 +1038,7 @@ def scan_pattern_sinks(sf: SourceFile, emit, masked: Optional[str] = None) -> No
     rem4 = RULES["RS-SEC-004"].remediation
     file_text = sf.text
     if sf.lang == "js":
-        uses_child_process = "child_process" in file_text
+        uses_child_process = bool(_JS_SHELL_IMPORT_RE.search(file_text))
         for lineno, line in enumerate(stripped, 1):
             if not line.strip():
                 continue
@@ -1405,6 +1417,30 @@ _JS_CC_TERNARY_RE = re.compile(r"(?<![?])\?(?![.?:,)\]>])")
 _JS_BLOCK_KW_RE = re.compile(r"(?<![\w$.])(if|for|while|do|switch|try)\b")
 _JS_EMPTY_CATCH_RE = re.compile(r"(?<![\w$.])catch\s*(?:\([^()]*\))?\s*\{\s*\}")
 _JS_TEST_FILE_RE = re.compile(r"(?:^|/)(?:__tests__|__mocks__)/|\.(?:test|spec)\.[cm]?[jt]sx?$", re.IGNORECASE)
+# RS-SEC-006 patterns (run on masked text unless noted)
+_JS_SEC_TLS_RE = re.compile(r"(?<![\w$])rejectUnauthorized\s*:\s*false(?![\w$])")
+_JS_SEC_TLS_ENV_RE = re.compile(  # original text; the value is a string literal
+    r"process\s*\.\s*env\s*(?:\.\s*NODE_TLS_REJECT_UNAUTHORIZED|\[\s*['\"]NODE_TLS_REJECT_UNAUTHORIZED['\"]\s*\])"
+    r"\s*=\s*(['\"])0\1")
+_JS_SEC_HASH_RE = re.compile(r"(?<![\w$])createHash\s*\(\s*(['\"])")
+_JS_SEC_RANDOM_RE = re.compile(r"(?<![\w$.])Math\s*\.\s*random\s*\(")
+_JS_SEC_SECRET_IDENT_RE = re.compile(r"(?<![\w$])[\w$]*(?:token|secret|password|nonce|session|csrf|otp)[\w$]*", re.IGNORECASE)
+_JS_SEC_JWT_ALG_RE = re.compile(r"(?<![\w$])algorithms\s*:\s*\[")
+_JS_SEC_JWT_NONE_RE = re.compile(r"['\"]none['\"]", re.IGNORECASE)
+_JS_SEC_CORS_ORIGIN_RE = re.compile(r"(?<![\w$])origin\s*:\s*(['\"])")
+_JS_SEC_CORS_CRED_RE = re.compile(r"(?<![\w$])credentials\s*:\s*true(?![\w$])")
+_JS_SEC_DSIH_RE = re.compile(r"dangerouslySetInnerHTML\s*=\s*\{\s*\{\s*__html\s*:\s*")
+_JS_SEC_FS_IMPORT_RE = re.compile(r"['\"](?:node:)?fs(?:/promises)?['\"]|\bfs\s*\.\s*promises\b")
+_JS_SEC_FS_CALL_RE = re.compile(
+    r"(?<![\w$])(readFile|readFileSync|createReadStream|createWriteStream|writeFile|writeFileSync|appendFile|"
+    r"appendFileSync|unlink|unlinkSync|readdir|readdirSync|rm|rmSync|rmdir|rmdirSync)\s*\(")
+_JS_SEC_REQ_DATA_RE = re.compile(r"(?<![\w$])(?:req|request)\s*\.|(?<![\w$.])(?:params|query|body|argv)(?![\w$])")
+_JS_SEC_REGEXP_RE = re.compile(r"(?<![\w$.])new\s+RegExp\s*\(")
+_JS_SHELL_IMPORT_RE = re.compile(r"['\"](?:node:)?child_process['\"]|['\"](?:execa|shelljs)['\"]")
+
+
+def _downgrade(severity: str) -> str:
+    return SEVERITIES[max(0, SEVERITY_RANK[severity] - 1)]
 
 
 def js_is_test_file(rel: str) -> bool:
@@ -1739,6 +1775,97 @@ class JsAnalyzer:
         for m in _JS_REQUIRE_RE.finditer(masked):
             add(m.start(1), False)
         return [found[k] for k in sorted(found)]
+
+    # -- RS-SEC-006: insecure configuration -------------------------------
+    def _sec(self, severity: str, confidence: str, offset: int, message: str) -> None:
+        if self.test_file:
+            severity = _downgrade(severity)
+        self._finding("RS-SEC-006", severity, confidence, offset, message + " (JS/TS, approximate)")
+
+    def _enclosing_object(self, offset: int) -> Tuple[int, int]:
+        """Span of the innermost `{ ... }` object literal around `offset` on
+        masked text, or (0, len) when none is found."""
+        masked = self.masked
+        depth = 0
+        k = offset
+        while k >= 0:
+            ch = masked[k]
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                if depth == 0:
+                    return k, _js_match_forward(masked, k, "{", "}")
+                depth -= 1
+            k -= 1
+        return 0, len(masked)
+
+    def _call_arg(self, paren: int, limit: int = 400) -> str:
+        return _extract_first_arg(self.masked[paren:paren + limit], 0)
+
+    def run_security(self) -> None:
+        masked, text = self.masked, self.sf.text
+        for m in _JS_SEC_TLS_RE.finditer(masked):
+            self._sec("high", "medium", m.start(), "TLS certificate verification disabled with rejectUnauthorized: false")
+        for m in _JS_SEC_TLS_ENV_RE.finditer(text):
+            if masked[m.start()] == "p":  # not inside a comment or string
+                self._sec("high", "medium", m.start(), "TLS certificate verification disabled via NODE_TLS_REJECT_UNAUTHORIZED='0'")
+        for m in _JS_SEC_HASH_RE.finditer(masked):
+            q = m.start(1)
+            end = text.find(text[q], q + 1)
+            algo = text[q + 1:end].strip().lower() if end != -1 else ""
+            if algo in ("md5", "sha1", "sha-1"):
+                self._sec("medium", "medium", m.start(),
+                          "Weak hash createHash('%s'); unsuitable for passwords or signatures (fine for non-security checksums)" % algo)
+        if _JS_SEC_RANDOM_RE.search(masked):
+            lines = masked.splitlines()
+            for m in _JS_SEC_RANDOM_RE.finditer(masked):
+                line, _ = js_line_col(self.starts, m.start())
+                window = "\n".join(lines[max(0, line - 4):line + 3])
+                ident = _JS_SEC_SECRET_IDENT_RE.search(window)
+                if ident:
+                    self._sec("medium", "medium", m.start(),
+                              "Math.random() used near '%s'; not cryptographically secure" % ident.group(0))
+        for m in _JS_SEC_JWT_ALG_RE.finditer(masked):
+            close = text.find("]", m.end())
+            if close != -1 and _JS_SEC_JWT_NONE_RE.search(text[m.end():close]):
+                self._sec("high", "medium", m.start(), "JWT verification accepts the 'none' algorithm")
+        for m in _JS_SEC_CORS_ORIGIN_RE.finditer(masked):
+            q = m.start(1)
+            if text[q + 1:q + 3] != "*" + text[q]:
+                continue
+            start, end = self._enclosing_object(m.start())
+            if _JS_SEC_CORS_CRED_RE.search(masked, start, end):
+                self._sec("medium", "medium", m.start(), "CORS wildcard origin '*' combined with credentials: true")
+        for m in _JS_SEC_DSIH_RE.finditer(masked):
+            k = m.end()
+            depth = 0
+            n = len(masked)
+            while k < n and k - m.end() < 400:
+                ch = masked[k]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    break
+                k += 1
+            value = masked[m.end():k].strip()
+            if _is_literal_arg(value):
+                self._sec("low", "medium", m.start(), "dangerouslySetInnerHTML with a constant string")
+            else:
+                self._sec("high", "medium", m.start(), "dangerouslySetInnerHTML with non-constant __html (XSS sink)")
+        if _JS_SEC_FS_IMPORT_RE.search(text):
+            for m in _JS_SEC_FS_CALL_RE.finditer(masked):
+                arg = self._call_arg(m.end() - 1)
+                if _JS_SEC_REQ_DATA_RE.search(arg):
+                    self._sec("medium", "low", m.start(1),
+                              "fs.%s() path built from request data (possible path traversal)" % m.group(1))
+        for m in _JS_SEC_REGEXP_RE.finditer(masked):
+            arg = self._call_arg(m.end() - 1)
+            if _JS_SEC_REQ_DATA_RE.search(arg):
+                self._sec("low", "low", m.start(), "new RegExp() built from request data (ReDoS / pattern injection)")
 
 
 # --------------------------------------------------------------------------
@@ -3063,6 +3190,8 @@ class Scanner:
         analyzer.run_quality()
         if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
             scan_pattern_sinks(sf, self._emit, analyzer.masked)
+        if "RS-SEC-006" in self.enabled:
+            analyzer.run_security()
         if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
             self.js_modules.append(JsModule(sf.rel, analyzer.collect_imports()))
 
@@ -3385,9 +3514,13 @@ def render_rule_catalog() -> str:
         out.append("    languages: %s" % rule.languages)
         out.append("    %s" % rule.description)
     out.append("")
-    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript, C/C++ and shell")
-    out.append("files are scanned with regular-expression patterns only (RS-SEC-003, RS-SEC-004 and the")
-    out.append("secret rules); those findings carry confidence low or medium.")
+    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript files are lexically")
+    out.append("masked (comments, strings, template text, regex literals and JSX text blanked) and analysed")
+    out.append("approximately: brace-matched function discovery feeds RS-QUAL-001/002/004, a relative-import")
+    out.append("graph with tsconfig/jsconfig path aliases feeds RS-ARCH-001/002, and RS-SEC-003/004/006 are")
+    out.append("pattern-based on the masked code. JS/TS findings carry confidence low or medium. C/C++ and")
+    out.append("shell files are scanned with regular-expression patterns only (RS-SEC-003, RS-SEC-004 and")
+    out.append("the secret rules); those findings also carry confidence low or medium.")
     out.append("Suppress a finding with a comment `reposentry: ignore RS-XXX-NNN` on the same or the")
     out.append("preceding line, or record known findings with --write-baseline / --baseline.")
     return "\n".join(out) + "\n"
@@ -4486,6 +4619,93 @@ class TestJsImportGraph(_ProjectMixin, unittest.TestCase):
         self.assertIn("'domain' must not import layer 'api'", layer[0].message)
         findings = self.scan_files(files, {"forbidden_imports": [{"from": "domain", "to": "api"}]})
         self.assertEqual([f.file for f in self.by_rule(findings, "RS-ARCH-002")], ["src/domain/models.ts"])
+
+
+class TestJsSecurity(_ProjectMixin, unittest.TestCase):
+    def test_sinks_on_masked_code(self):
+        src = ("const { exec } = require('child_process');\n"   # 1
+               "exec(userInput);\n"                              # 2 critical
+               "exec(\"ls\");\n"                                 # 3 medium
+               "eval(x);\n"                                      # 4 critical
+               "// eval(x)\n"                                    # 5 not flagged
+               "const s = \"eval(x)\";\n"                        # 6 not flagged
+               "el.innerHTML = x;\n"                             # 7 high
+               "el.innerHTML = \"<b>\";\n"                       # 8 medium
+               "exec(`rm -rf ${dir}`);\n"                        # 9 critical
+               "exec('ls' + dir);\n")                            # 10 critical
+        findings = self.scan_files({"a.js": src})
+        sev = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertEqual(sev, {(2, "RS-SEC-003"): "critical", (3, "RS-SEC-003"): "medium", (4, "RS-SEC-004"): "critical",
+                               (7, "RS-SEC-004"): "high", (8, "RS-SEC-004"): "medium", (9, "RS-SEC-003"): "critical",
+                               (10, "RS-SEC-003"): "critical"})
+        self.assertTrue(SEVERITY_RANK[sev[(8, "RS-SEC-004")]] < SEVERITY_RANK[sev[(7, "RS-SEC-004")]])
+
+    def test_execa_and_shelljs_count_as_shell(self):
+        findings = self.scan_files({"a.js": "import { exec } from 'execa';\nexec(cmd);\n",
+                                    "b.js": "const sh = require('shelljs');\nsh.exec(cmd);\n",
+                                    "c.js": "const exec = (x) => x;\nexec(cmd);\n"})
+        self.assertEqual(sorted(f.file for f in self.by_rule(findings, "RS-SEC-003")), ["a.js", "b.js"])
+
+    def test_dangerously_set_inner_html(self):
+        src = ("export function View({ html }) {\n"
+               "  return (\n    <div>\n      <p dangerouslySetInnerHTML={{ __html: html }} />\n"
+               "      <p dangerouslySetInnerHTML={{__html: \"<b>static</b>\"}} />\n    </div>\n  );\n}\n")
+        findings = self.scan_files({"view.jsx": src})
+        hits = sorted((f.line, f.severity) for f in self.by_rule(findings, "RS-SEC-006"))
+        self.assertEqual(hits, [(4, "high"), (5, "low")])
+
+    SEC006 = (
+        "const https = require('https');\n"                                          # 1
+        "const crypto = require('crypto');\n"                                        # 2
+        "const fs = require('fs');\n"                                                # 3
+        "const agent = new https.Agent({ rejectUnauthorized: false });\n"            # 4 high
+        "const okAgent = new https.Agent({ rejectUnauthorized: true });\n"           # 5
+        "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';\n"                          # 6 high
+        "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';\n"                          # 7
+        "// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';\n"                       # 8
+        "const h1 = crypto.createHash('md5').update(pw).digest('hex');\n"            # 9 medium
+        "const h2 = crypto.createHash('sha256').update(pw).digest('hex');\n"         # 10
+        "const sessionToken = Math.random().toString(36).slice(2);\n"                # 11 medium
+        "const a1 = 1;\n"                                                            # 12
+        "const a2 = 2;\n"                                                            # 13
+        "const a3 = 3;\n"                                                            # 14
+        "const a4 = 4;\n"                                                            # 15
+        "const jitter = Math.random() * 100;\n"                                      # 16
+        "const b1 = 1;\n"                                                            # 17
+        "const b2 = 2;\n"                                                            # 18
+        "const b3 = 3;\n"                                                            # 19
+        "const b4 = 4;\n"                                                            # 20
+        "jwt.verify(t, key, { algorithms: ['HS256', 'none'] });\n"                   # 21 high
+        "jwt.verify(t, key, { algorithms: ['HS256'] });\n"                           # 22
+        "app.use(cors({ origin: '*', credentials: true }));\n"                       # 23 medium
+        "app.use(cors({ origin: '*' }));\n"                                          # 24
+        "app.use(cors({ origin: 'https://x.example', credentials: true }));\n"       # 25
+        "fs.readFile(`${base}/${req.query.name}`, cb);\n"                            # 26 medium
+        "fs.readFile('/etc/hosts', cb);\n"                                           # 27
+        "fs.unlinkSync(path.join(base, params.id));\n"                               # 28 medium
+        "const re1 = new RegExp(req.query.q);\n"                                     # 29 low
+        "const re2 = new RegExp('^abc$');\n"                                         # 30
+    )
+
+    def test_sec006_positives_and_negatives(self):
+        findings = self.scan_files({"server.js": self.SEC006})
+        hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(hits, {4: "high", 6: "high", 9: "medium", 11: "medium", 21: "high", 23: "medium",
+                                26: "medium", 28: "medium", 29: "low"})
+        self.assertTrue(all(f.confidence in ("low", "medium") and "approximate" in f.message
+                            for f in self.by_rule(findings, "RS-SEC-006")))
+
+    def test_sec006_downgraded_in_test_files(self):
+        findings = self.scan_files({"server.test.js": self.SEC006})
+        hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(hits, {4: "medium", 6: "medium", 9: "low", 11: "low", 21: "medium", 23: "low",
+                                26: "low", 28: "low", 29: "low"})
+
+    def test_list_rules_describes_sec006(self):
+        code, out, _ = self.run_cli(["--list-rules"])
+        self.assertEqual(code, 0)
+        self.assertIn("RS-SEC-006", out)
+        self.assertIn("JS/TS: pattern-based, approximate", out)
 
 
 if __name__ == "__main__":
