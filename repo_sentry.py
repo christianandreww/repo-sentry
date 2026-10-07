@@ -20,12 +20,13 @@ import math
 import os
 import re
 import stat as statmod
+import subprocess
 import sys
 import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -159,6 +160,12 @@ for _r in (
          "Use ast.literal_eval, json, yaml.safe_load, importlib.import_module with an "
          "allow-list, textContent instead of innerHTML, and bounded string functions.",
          "python, js, c"),
+    Rule("RS-SEC-005", "Secret in git history", "high", "security",
+         "A known secret pattern was added in an earlier commit and is no longer present in the working tree "
+         "(enable with --history). Deleting a secret from the latest commit does not revoke it.",
+         "Rotate the credential immediately; rewriting history (git filter-repo / BFG) is optional and "
+         "only helps if no one has cloned the repo.",
+         "all"),
     Rule("RS-SYS-001", "File could not be parsed", "low", "system",
          "The file could not be read, decoded or parsed (SyntaxError, encoding error). "
          "The scan continues; the file is still pattern-scanned for secrets.",
@@ -634,6 +641,18 @@ YAML_EXTS = {".yaml", ".yml"}
 PLACEHOLDER_WORDS = ("example", "changeme", "change_me", "change-me", "xxxx", "your_", "your-", "<", ">",
                      "dummy", "test", "sample", "placeholder", "todo", "fixme", "replace", "insert",
                      "password", "secret", "redacted", "lorem", "null", "none", "fake", "mock")
+KNOWN_DEFAULT_SECRETS = frozenset((
+    "youshallnotpass", "admin", "administrator", "adminadmin", "root", "toor", "guest", "default", "changeit",
+    "letmein", "qwerty12", "password1", "password123", "secret123", "12345678", "123456789", "1234567890",
+    "welcome1", "p@ssw0rd", "passw0rd", "pass1234"))
+EXAMPLE_FILE_RE = re.compile(r"(?:^|[.\-_])(?:example|sample|template|dist|tmpl)(?:[.\-_]|$)", re.IGNORECASE)
+
+
+def is_example_file(rel: str) -> bool:
+    """.env.example, application.example.yml, config.sample.json ... -- files meant to hold placeholders."""
+    return bool(EXAMPLE_FILE_RE.search(os.path.basename(rel)))
+
+
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
@@ -692,10 +711,24 @@ def scan_secrets(sf: SourceFile, config: Config, emit, entropy_enabled: bool) ->
     yaml_style = ext in YAML_EXTS
     remediation = RULES["RS-SEC-001"].remediation
     total = len(sf.lines)
+    example_file = is_example_file(sf.rel)
+    if example_file:
+        entropy_enabled = False
 
     def report_pattern(lineno: int, col: int, label: str, secret: str, severity: str, confidence: str) -> None:
         emit(Finding("RS-SEC-001", severity, confidence, sf.rel, lineno, col,
                      "%s detected: %s" % (label, redact_secret(secret)), sf.snippet(lineno), remediation))
+
+    def report_generic(lineno: int, col: int, label: str, value: str) -> None:
+        """Heuristic (non-token) findings: skipped for well-known defaults in example files, low in other example
+        files, labelled when a well-known default is used in a real file."""
+        default = value.strip("'\"").lower() in KNOWN_DEFAULT_SECRETS
+        if example_file:
+            if default:
+                return
+            report_pattern(lineno, col, label + " (example file)", value, "low", "low")
+            return
+        report_pattern(lineno, col, label + (" (well-known default value)" if default else ""), value, "high", "medium")
 
     idx = 0
     while idx < total:
@@ -750,19 +783,19 @@ def scan_secrets(sf: SourceFile, config: Config, emit, entropy_enabled: bool) ->
                 continue
             sf.add_redaction(lineno, m.start(3), m.end(3))
             spans.append((m.start(3), m.end(3)))
-            report_pattern(lineno, m.start(3) + 1, "Hardcoded %s assignment" % m.group(1).lower(), value, "high", "medium")
+            report_generic(lineno, m.start(3) + 1, "Hardcoded %s assignment" % m.group(1).lower(), value)
         if env_style:
             m = ENV_SECRET_RE.match(line)
             if m and not looks_like_placeholder(m.group(2)) and not any(s <= m.start(2) < e for s, e in spans):
                 sf.add_redaction(lineno, m.start(2), m.end(2))
                 spans.append((m.start(2), m.end(2)))
-                report_pattern(lineno, m.start(2) + 1, "Hardcoded %s value" % m.group(1), m.group(2), "high", "medium")
+                report_generic(lineno, m.start(2) + 1, "Hardcoded %s value" % m.group(1), m.group(2))
         if yaml_style:
             m = YAML_SECRET_RE.match(line)
             if m and not looks_like_placeholder(m.group(2)) and not any(s <= m.start(2) < e for s, e in spans):
                 sf.add_redaction(lineno, m.start(2), m.end(2))
                 spans.append((m.start(2), m.end(2)))
-                report_pattern(lineno, m.start(2) + 1, "Hardcoded %s value" % m.group(1), m.group(2), "high", "medium")
+                report_generic(lineno, m.start(2) + 1, "Hardcoded %s value" % m.group(1), m.group(2))
         if not entropy_enabled or len(line) < min_len or not entropy_trigger_re.search(line):
             continue
         low = line.lower()
@@ -2225,6 +2258,121 @@ def scan(root: str, config: Optional[Config] = None, rules: Optional[Set[str]] =
 
 
 # --------------------------------------------------------------------------
+# Git history scan (RS-SEC-005)
+# --------------------------------------------------------------------------
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def scan_history(scanner: "Scanner", max_commits: int = 500) -> int:
+    """Scan lines ADDED by past commits for known secret patterns. Reports only secrets that no longer appear in
+    the working tree (those still present are already RS-SEC-001). Returns the number of commits examined.
+    Requires the `git` executable; failures are reported as warnings, never crashes."""
+    root = scanner.root if os.path.isdir(scanner.root) else (os.path.dirname(scanner.root) or ".")
+    try:
+        probe = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"], capture_output=True,
+                               text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        scanner.warnings.append("--history: git is not available (%s)" % exc)
+        return 0
+    if probe.returncode != 0:
+        scanner.warnings.append("--history: %s is not inside a git work tree" % root)
+        return 0
+    top = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    prefix = subprocess.run(["git", "-C", root, "rev-parse", "--show-prefix"], capture_output=True, text=True).stdout.strip()
+    if os.path.isfile(os.path.join(top, ".git", "shallow")):
+        scanner.warnings.append("--history: this is a shallow clone, so only the available commits are scanned")
+    cmd = ["git", "-C", root, "log", "--all", "--no-color", "--no-ext-diff", "--unified=0", "-p", "-n", str(max_commits),
+           "--format=@@COMMIT\x1f%H\x1f%an\x1f%aI"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        scanner.warnings.append("--history: cannot run git (%s)" % exc)
+        return 0
+    cfg = scanner.config
+    seen: Set[Tuple[str, str]] = set()
+    current_cache: Dict[str, Set[str]] = {}
+    commits = 0
+    commit: Tuple[str, str, str] = ("", "", "")
+    path: Optional[str] = None
+    added: List[Tuple[int, str]] = []
+
+    def current_lines(rel: str) -> Set[str]:
+        if rel not in current_cache:
+            try:
+                with open(os.path.join(top, rel), "r", encoding="utf-8", errors="replace") as fh:
+                    current_cache[rel] = {ln.strip() for ln in fh}
+            except OSError:
+                current_cache[rel] = set()
+        return current_cache[rel]
+
+    def ignored(rel: str) -> bool:
+        parts = rel.split("/")
+        if any(part in cfg.ignore_dirs for part in parts[:-1]):
+            return True
+        return any(fnmatch.fnmatchcase(parts[-1], g) or fnmatch.fnmatchcase(rel, g) for g in cfg.ignore_globs)
+
+    def flush() -> None:
+        nonlocal added
+        if path is None or not added or not commit[0]:
+            added = []
+            return
+        rel = path[len(prefix):] if prefix and path.startswith(prefix) else path
+        if prefix and not path.startswith(prefix) or ignored(path) or is_lockfile(rel):
+            added = []
+            return
+        sf = SourceFile(path, "", "\n".join(text for _, text in added), detect_language(path, added[0][1]))
+        numbers = [n for n, _ in added]
+        now = current_lines(path)
+
+        def emit(f: Finding) -> None:
+            if f.rule_id != "RS-SEC-001" or not (1 <= f.line <= len(numbers)):
+                return
+            if sf.raw_line(f.line).strip() in now:
+                return  # still in the working tree: reported by the normal scan
+            key = (path, f.snippet)
+            if key in seen:
+                return
+            seen.add(key)
+            sha, author, date = commit
+            msg = "%s -- added in commit %s (%s, %s) and since removed" % (f.message, sha[:8], date[:10], author)
+            scanner._emit(Finding("RS-SEC-005", "critical" if f.severity == "critical" else "high", f.confidence,
+                                  path, numbers[f.line - 1], f.col, msg, f.snippet, RULES["RS-SEC-005"].remediation))
+
+        scan_secrets(sf, cfg, emit, False)
+        added = []
+
+    assert proc.stdout is not None
+    try:
+        lineno = 0
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if line.startswith("@@COMMIT\x1f"):
+                flush()
+                path = None
+                parts = line.split("\x1f")
+                commit = (parts[1], parts[2], parts[3]) if len(parts) >= 4 else ("", "", "")
+                commits += 1
+            elif line.startswith("+++ "):
+                flush()
+                path = line[6:] if line.startswith("+++ b/") else None
+            elif line.startswith("--- "):
+                continue
+            elif line.startswith("@@"):
+                flush()
+                m = _HUNK_RE.match(line)
+                lineno = int(m.group(1)) if m else 0
+            elif line.startswith("+") and path is not None:
+                if len(line) < 2000:
+                    added.append((lineno, line[1:]))
+                lineno += 1
+        flush()
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    return commits
+
+
+# --------------------------------------------------------------------------
 # Baseline
 # --------------------------------------------------------------------------
 def load_baseline(path: str) -> Set[str]:
@@ -2433,6 +2581,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-test", action="store_true", help="run the embedded test suite and exit")
     p.add_argument("--no-color", action="store_true", help="disable ANSI colours")
     p.add_argument("--max-file-kb", type=int, default=1024, help="skip files larger than this (default 1024)")
+    p.add_argument("--history", action="store_true",
+                   help="also scan lines added by past commits for secrets that were later removed (RS-SEC-005; needs git)")
+    p.add_argument("--history-max", type=int, default=500, metavar="N", help="max commits for --history (default 500)")
     p.add_argument("--version", action="store_true", help="print the version and exit")
     return p
 
@@ -2486,6 +2637,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sys.stderr.write("warning: %s\n" % w)
         scanner = Scanner(path, config, rules, ignore_rules)
         result = scanner.run()
+        if args.history:
+            if args.history_max < 1:
+                raise ConfigError("--history-max must be >= 1")
+            scan_history(scanner, args.history_max)
+            scanner.findings.sort(key=lambda f: f.sort_key())
         for w in result.warnings:
             sys.stderr.write("warning: %s\n" % w)
         all_findings = result.findings
@@ -2827,6 +2983,81 @@ class TestQualityRules(_ProjectMixin, unittest.TestCase):
         findings = self.scan_files({"a.py": src})
         self.assertEqual(len(self.by_rule(findings, "RS-QUAL-003")), 1)
         self.assertEqual(sorted(f.line for f in self.by_rule(findings, "RS-QUAL-004")), [9, 14])
+
+
+class TestExampleFilesAndHistory(_ProjectMixin, unittest.TestCase):
+    AWS = "AKIA" + "J7Q2M9X4L1P8R6T3"
+
+    def test_known_default_in_example_file_is_skipped(self):
+        files = {".env.example": "LAVALINK_PASSWORD=youshallnotpass\n",
+                 "lavalink/application.example.yml": "lavalink:\n  server:\n    password: \"youshallnotpass\"\n"}
+        self.assertEqual(self.by_rule(self.scan_files(files), "RS-SEC-001"), [])
+
+    def test_known_default_in_real_file_is_flagged_and_labelled(self):
+        hits = self.by_rule(self.scan_files({".env": "LAVALINK_PASSWORD=youshallnotpass\n"}), "RS-SEC-001")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("well-known default", hits[0].message)
+        self.assertEqual(hits[0].severity, "high")
+
+    def test_unknown_value_in_example_file_is_low_and_real_token_stays_critical(self):
+        files = {".env.example": "API_TOKEN=Zk39dLmQ82xPwv7R\n", "settings.sample.py": "KEY = '%s'\n" % self.AWS}
+        hits = {f.file: f for f in self.by_rule(self.scan_files(files), "RS-SEC-001")}
+        self.assertEqual(hits[".env.example"].severity, "low")
+        self.assertEqual(hits["settings.sample.py"].severity, "critical")
+
+    def test_is_example_file(self):
+        for name in (".env.example", "a/b/application.example.yml", "config.sample.json", "x.env.template", "settings.dist"):
+            self.assertTrue(is_example_file(name), name)
+        for name in (".env", "examples.py", "app.yml", "sampler.py"):
+            self.assertFalse(is_example_file(name), name)
+
+    def _git(self, cwd, *args):
+        subprocess.run(["git", "-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"] + list(args),
+                       check=True, capture_output=True)
+
+    def test_history_finds_removed_secret_only(self):
+        try:
+            subprocess.run(["git", "--version"], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git not available")
+        root = self.make_project({"app.py": "KEY = '%s'\nprint(1)\n" % self.AWS})
+        self._git(root, "init", "-q")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-qm", "add key")
+        with open(os.path.join(root, "app.py"), "w", encoding="utf-8") as fh:
+            fh.write("import os\nKEY = os.environ['K']\n")
+        self._git(root, "commit", "-qam", "remove key")
+        sc = Scanner(root, Config())
+        res = sc.run()
+        self.assertEqual(self.by_rule(res.findings, "RS-SEC-001"), [])
+        self.assertEqual(scan_history(sc), 2)
+        hist = self.by_rule(sc.findings, "RS-SEC-005")
+        self.assertEqual(len(hist), 1)
+        self.assertEqual((hist[0].file, hist[0].line, hist[0].severity), ("app.py", 1, "critical"))
+        self.assertNotIn(self.AWS, json.dumps([f.to_dict() for f in sc.findings]))
+        self.assertIn("commit", hist[0].message)
+
+    def test_history_skips_secret_still_in_tree(self):
+        try:
+            subprocess.run(["git", "--version"], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git not available")
+        root = self.make_project({"app.py": "KEY = '%s'\n" % self.AWS})
+        self._git(root, "init", "-q")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-qm", "add key")
+        sc = Scanner(root, Config())
+        sc.run()
+        scan_history(sc)
+        self.assertEqual(self.by_rule(sc.findings, "RS-SEC-005"), [])
+        self.assertEqual(len(self.by_rule(sc.findings, "RS-SEC-001")), 1)
+
+    def test_history_outside_git_is_a_warning_not_a_crash(self):
+        root = self.make_project({"a.py": "x = 1\n"})
+        sc = Scanner(root, Config())
+        sc.run()
+        self.assertEqual(scan_history(sc), 0)
+        self.assertTrue(any("--history" in w for w in sc.warnings))
 
 
 class TestSecrets(_ProjectMixin, unittest.TestCase):

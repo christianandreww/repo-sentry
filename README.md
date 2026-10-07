@@ -9,6 +9,8 @@ Planned checks:
 - **Resources:** file and socket opens not wrapped in `with` or `try/finally`
 - **Quality:** cyclomatic complexity, deep nesting, bare or swallowed exceptions
 - **Security:** secret scanning (patterns + Shannon entropy), command injection and dynamic-execution sinks (Python is parsed with `ast`; JS/TS, C/C++ and shell are pattern-based)
+- **History:** `--history` scans past commits for secrets that were added and later removed (RS-SEC-005; needs `git`)
+- **Example files:** `.env.example`, `*.sample.*` etc. skip well-known default passwords and downgrade other heuristic hits to low; real tokens (AWS, GitHub...) stay critical
 - **Output:** terminal (ANSI), JSON and Markdown, with CI-friendly exit codes
 
 ## Status
