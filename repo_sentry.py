@@ -1587,8 +1587,8 @@ def js_discover_functions(masked: str) -> List[JsFunction]:
         if body < 0:
             continue
         name = m.group(1)
-        if not name:
-            name = "default" if _JS_EXPORT_DEFAULT_TAIL_RE.search(masked[max(0, m.start() - 40):m.start()]) else "<anonymous>"
+        if not name:  # function expression: take the name from `key:`, `x =`, `const x =` or `export default`
+            name = _js_arrow_name(masked, m.start())
         add(name, m.start(), body)
     for m in _JS_METHOD_RE.finditer(masked):
         name = m.group(1)
@@ -3190,7 +3190,12 @@ class Scanner:
             return
         analyzer.run_quality()
         if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
-            scan_pattern_sinks(sf, self._emit, analyzer.masked)
+            sink_emit = self._emit
+            if analyzer.test_file:  # sinks in tests are usually fixtures: one level lower, like RS-SEC-006
+                def sink_emit(f: Finding) -> None:
+                    f.severity = _downgrade(f.severity)
+                    self._emit(f)
+            scan_pattern_sinks(sf, sink_emit, analyzer.masked)
         if "RS-SEC-006" in self.enabled:
             analyzer.run_security()
         if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
@@ -4701,6 +4706,19 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
         self.assertEqual(hits, {4: "medium", 6: "medium", 9: "low", 11: "low", 21: "medium", 23: "low",
                                 26: "low", 28: "low", 29: "low"})
+
+    def test_function_expression_names(self):
+        src = ("const o = { f: function (q) { if (q) {} }, g: async function () {}, h: (a) => { if (a) {} } };\n"
+               "const k = function () { if (1) {} };\nexport default function () {}\n[1].map(function () {});\n")
+        names = [f.name for f in js_discover_functions(js_mask(src))]
+        self.assertEqual(names, ["f", "g", "h", "k", "default", "<anonymous>"])
+
+    def test_sinks_downgraded_in_test_files(self):
+        code = "import { exec } from 'child_process';\nexec(userInput);\neval(x);\nexec('ls');\n"
+        real = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.js": code})}
+        test = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.test.js": code})}
+        self.assertEqual(real, {("RS-SEC-003", 2): "critical", ("RS-SEC-004", 3): "critical", ("RS-SEC-003", 4): "medium"})
+        self.assertEqual(test, {("RS-SEC-003", 2): "high", ("RS-SEC-004", 3): "high", ("RS-SEC-003", 4): "low"})
 
     def test_list_rules_describes_sec006(self):
         code, out, _ = self.run_cli(["--list-rules"])

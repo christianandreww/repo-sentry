@@ -32,7 +32,7 @@ JS/TS support is deliberately approximate and every JS/TS finding says so:
 - Functions are found by brace matching (`function`, arrows with block bodies, class and object methods, getters/setters, constructors). Expression-bodied arrows belong to their enclosing function. TypeScript return types are skipped heuristically; unusual formatting can merge or miss a function.
 - Complexity counts `if`, `for`, `while`, `case`, `catch`, `&&`, `||`, `??` and ternaries on the masked text; nesting counts `if/for/while/do/switch/try` blocks. Both are estimates, reported at confidence `medium`.
 - The import graph resolves only relative specifiers and `tsconfig.json`/`jsconfig.json` `baseUrl`/`paths`; bare package names are dropped. `import type`, dynamic `import()` and imports inside functions are soft edges.
-- `*.d.ts`, minified/bundled files, `*.map` and `node_modules`, `dist`, `build`, `coverage`, `.next`, `.nuxt`, `out` are skipped by default. Test files (`*.test.*`, `*.spec.*`, `__tests__/`) skip complexity and nesting and downgrade RS-SEC-006 one level.
+- `*.d.ts`, minified/bundled files, `*.map` and `node_modules`, `dist`, `build`, `coverage`, `.next`, `.nuxt`, `out` are skipped by default. Test files (`*.test.*`, `*.spec.*`, `__tests__/`) skip complexity and nesting and downgrade RS-SEC-003, RS-SEC-004 and RS-SEC-006 one level.
 
 ## Status
 
