@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -88,7 +88,7 @@ for _r in (
          "Use the async equivalent (asyncio.sleep, aiohttp/httpx.AsyncClient, "
          "asyncio.create_subprocess_exec, aiofiles) or offload with "
          "`await asyncio.to_thread(...)` / `loop.run_in_executor(...)`.",
-         "python, js (approximate)"),
+         "python, js"),
     Rule("RS-ASYNC-002", "Fire-and-forget task", "medium", "async",
          "asyncio.create_task / ensure_future / loop.create_task whose result is "
          "discarded or stored in a variable that is never awaited, gathered, returned "
@@ -96,7 +96,7 @@ for _r in (
          "their exceptions are silently lost.",
          "Keep a strong reference and await/gather the task, use asyncio.TaskGroup, or "
          "attach add_done_callback to surface exceptions.",
-         "python, js (approximate)"),
+         "python, js"),
     Rule("RS-ASYNC-003", "Unprotected shared mutable state", "medium", "async",
          "A module-level list/dict/set is mutated inside an async def with no "
          "asyncio.Lock/threading.Lock held in scope. Concurrent coroutines can "
@@ -110,7 +110,7 @@ for _r in (
          "contextlib.closing, ExitStack.enter_context or a try/finally close(). Returned, "
          "yielded or stored resources are exempt.",
          "Wrap the resource in a `with` block or close it in a `finally` clause.",
-         "python, js (approximate)"),
+         "python, js"),
     Rule("RS-QUAL-001", "Cyclomatic complexity too high", "medium", "quality",
          "McCabe complexity above `max_cyclomatic_complexity` (default 10); high when "
          "above twice the threshold. Nested functions are scored separately.",
@@ -169,7 +169,8 @@ for _r in (
          "only helps if no one has cloned the repo.",
          "all"),
     Rule("RS-SEC-006", "Insecure configuration (JS/TS)", "medium", "security",
-         "JS/TS: pattern-based, approximate. TLS verification disabled (rejectUnauthorized: false, "
+         "JS/TS: parser-based, with heuristic fallback (pattern-based, approximate, confidence low/medium) "
+         "for files the parser cannot handle. TLS verification disabled (rejectUnauthorized: false, "
          "NODE_TLS_REJECT_UNAUTHORIZED='0') [high]; createHash('md5'|'sha1') [medium; fine for non-security "
          "checksums]; Math.random() near token/secret/password/nonce/session/csrf/otp identifiers [medium]; "
          "JWT algorithms containing 'none' [high]; CORS origin '*' with credentials: true [medium]; "
@@ -1948,15 +1949,18 @@ class JsParser:
     # statement handlers (return None when the keyword is actually an identifier)
     def stmt_var(self) -> Optional[JsNode]:
         t = self.tok
-        if t.value == "let":
-            p = self.peek()
-            if not (p.kind in ("name", "priv") or (p.kind == "punct" and p.value in ("[", "{"))):
-                return None
-            if p.kind == "name" and p.value in ("in", "instanceof", "of") and p.value != "of":
-                return None
+        if t.value == "let" and not self._let_is_declaration():
+            return None  # `let` used as an identifier
         node = self.parse_var_declaration(in_for=False)
         self.semicolon()
         return self.finish(node)
+
+    def _let_is_declaration(self) -> bool:
+        """`let` starts a declaration when a binding (name, `[` or `{`) follows."""
+        p = self.peek()
+        if p.kind == "name":
+            return p.value not in ("in", "instanceof")
+        return p.kind == "punct" and p.value in ("[", "{")
 
     def parse_var_declaration(self, in_for: bool) -> JsNode:
         t = self.next()
@@ -2009,7 +2013,7 @@ class JsParser:
         t = self.tok
         if t.kind == "punct" and t.value == ";":
             pass
-        elif t.kind == "name" and (t.value in ("var", "const") or (t.value == "let" and self.peek().kind != "punct")):
+        elif t.kind == "name" and (t.value in ("var", "const") or (t.value == "let" and self._let_is_declaration())):
             init = self.parse_var_declaration(in_for=True)
         else:
             init = self.parse_expression(no_in=True)
@@ -2796,10 +2800,7 @@ class JsParserExpressions:
                         node = JsNode("AwaitExpression", t.start, t.line, t.col, {})
                         node.fields["argument"] = self.parse_unary()
                         return self.finish(node)
-        expr = self.parse_postfix()
-        if self.is_p("**"):
-            return expr
-        return expr
+        return self.parse_postfix()
 
     def parse_type_assertion(self) -> JsNode:
         t = self.next()  # <
@@ -4095,6 +4096,11 @@ class JsFullParser(JsParser, JsParserExpressions, JsParserFunctions, JsParserTyp
     pass
 
 
+def js_parser_enabled() -> bool:
+    """The AST path is on unless REPO_SENTRY_JS_PARSER is 0/false/no/off."""
+    return os.environ.get("REPO_SENTRY_JS_PARSER", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def js_is_typescript(rel: str) -> bool:
     return os.path.splitext(rel)[1].lower() in (".ts", ".tsx", ".mts", ".cts")
 
@@ -4908,6 +4914,1019 @@ class JsModuleResolver:
                 if hit:
                     return hit
         return None
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: AST-based analysis (the accurate path)
+# --------------------------------------------------------------------------
+_JS_FUNCTION_TYPES = frozenset(("FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression", "StaticBlock"))
+_JS_LOOP_TYPES = frozenset(("ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement", "DoWhileStatement"))
+_JS_NESTING_TYPES = frozenset(("IfStatement", "ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement",
+                               "DoWhileStatement", "SwitchStatement", "TryStatement"))
+_JS_TAINT_NAMES = frozenset(("req", "request", "ctx", "params", "query", "body", "argv"))
+_JS_SHELL_MODULES = frozenset(("child_process", "node:child_process", "execa", "shelljs"))
+_JS_SHELL_PREFIXES = frozenset(("child_process", "cp", "childProcess", "proc", "sh", "shell", "shelljs", "execa"))
+_JS_FS_MODULES = frozenset(("fs", "node:fs", "fs/promises", "node:fs/promises", "fs-extra", "graceful-fs"))
+_JS_FS_PREFIXES = frozenset(("fs", "fsp", "fsPromises", "promises", "fse"))
+_JS_FS_PATH_METHODS = frozenset(("readFile", "readFileSync", "createReadStream", "createWriteStream", "writeFile",
+                                 "writeFileSync", "appendFile", "appendFileSync", "unlink", "unlinkSync", "readdir",
+                                 "readdirSync", "rm", "rmSync", "rmdir", "rmdirSync", "open", "openSync", "stat",
+                                 "statSync", "access", "accessSync", "copyFile", "copyFileSync", "rename", "renameSync"))
+_JS_SYNC_BLOCKING = frozenset((
+    "readFileSync", "writeFileSync", "appendFileSync", "readdirSync", "statSync", "lstatSync", "existsSync", "mkdirSync",
+    "rmSync", "rmdirSync", "unlinkSync", "copyFileSync", "renameSync", "execSync", "execFileSync", "spawnSync",
+    "pbkdf2Sync", "scryptSync", "randomBytesSync", "gzipSync", "gunzipSync", "deflateSync", "inflateSync",
+    "brotliCompressSync", "brotliDecompressSync", "accessSync", "openSync", "readSync", "writeSync", "closeSync",
+))
+_JS_RESOURCE_METHODS = frozenset(("createWriteStream", "createReadStream", "openSync", "open", "createConnection", "connect"))
+_JS_RESOURCE_ROOTS = frozenset(("fs", "fsp", "fsPromises", "promises", "net", "tls", "http2"))
+_JS_RELEASE_METHODS = frozenset(("close", "end", "destroy", "unref", "terminate", "removeAllListeners", "pipe"))
+_JS_READ_CONSUME_METHODS = frozenset(("on", "once", "read", "resume", "pipe", "addListener"))
+_JS_RELEASE_FUNCS = frozenset(("clearInterval", "pipeline", "finished", "closeSync", "close", "destroy"))
+_JS_SECRET_IDENT_RE = _JS_SEC_SECRET_IDENT_RE
+
+
+class JsFunctionInfo:
+    __slots__ = ("node", "name", "parent", "children", "is_async", "own", "class_name")
+
+    def __init__(self, node: JsNode, name: str, parent: Optional["JsFunctionInfo"]) -> None:
+        self.node = node
+        self.name = name
+        self.parent = parent
+        self.children: List["JsFunctionInfo"] = []
+        self.is_async = bool(node.fields.get("async"))
+        self.own: List[JsNode] = []   # nodes directly inside this function (nested functions excluded)
+        self.class_name = ""
+
+
+def _js_member_root(node: JsNode) -> Optional[str]:
+    """Identifier name at the root of a member chain (`a` for a.b.c), else None."""
+    while node.type == "MemberExpression":
+        node = node.fields["object"]  # type: ignore[assignment]
+    if node.type == "Identifier":
+        return node.fields["name"]  # type: ignore[return-value]
+    return None
+
+
+def _js_member_path(node: JsNode) -> Optional[str]:
+    """Dotted path for a non-computed member chain rooted at an identifier (`process.env.X`)."""
+    parts: List[str] = []
+    while node.type == "MemberExpression":
+        if node.fields["computed"]:
+            prop = node.fields["property"]
+            if isinstance(prop, JsNode) and prop.type == "Literal" and prop.fields.get("kind") == "string":
+                parts.append(str(prop.fields["value"]))
+            else:
+                return None
+        else:
+            parts.append(str(node.fields["property"]))
+        node = node.fields["object"]  # type: ignore[assignment]
+    if node.type == "Identifier":
+        parts.append(node.fields["name"])  # type: ignore[arg-type]
+    elif node.type == "ThisExpression":
+        parts.append("this")
+    else:
+        return None
+    return ".".join(reversed(parts))
+
+
+def _js_callee_name(call: JsNode) -> Tuple[Optional[str], Optional[str]]:
+    """(identifier name, None) for `f(...)`, (object path, property) for `a.b.f(...)`."""
+    callee = call.fields["callee"]
+    if callee.type == "Identifier":
+        return callee.fields["name"], None  # type: ignore[return-value]
+    if callee.type == "MemberExpression" and not callee.fields["computed"]:
+        return _js_member_path(callee.fields["object"]), callee.fields["property"]  # type: ignore[return-value]
+    return None, None
+
+
+def _js_pattern_names(node: Optional[JsNode]) -> List[str]:
+    """Identifier names bound by a binding pattern."""
+    out: List[str] = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n is None:
+            continue
+        t = n.type
+        if t == "Identifier":
+            out.append(n.fields["name"])  # type: ignore[arg-type]
+        elif t == "ObjectPattern":
+            for p in n.fields["properties"]:  # type: ignore[union-attr]
+                stack.append(p.fields["value"] if p.type == "Property" else p)
+        elif t == "ArrayPattern":
+            stack.extend(n.fields["elements"])  # type: ignore[arg-type]
+        elif t == "AssignmentPattern":
+            stack.append(n.fields["left"])  # type: ignore[arg-type]
+        elif t == "RestElement":
+            stack.append(n.fields["argument"])  # type: ignore[arg-type]
+    return out
+
+
+def _js_unwrap(node: JsNode) -> JsNode:
+    while node.type in ("ParenthesizedExpression", "TSAsExpression", "TSNonNullExpression", "TSTypeAssertion",
+                        "TSSatisfiesExpression", "AwaitExpression"):
+        node = node.fields.get("expression") or node.fields.get("argument")  # type: ignore[assignment]
+    return node
+
+
+def _js_string_value(node: Optional[JsNode]) -> Optional[str]:
+    """The constant string value of a literal or expression-free template, else None."""
+    if node is None:
+        return None
+    node = _js_unwrap(node)
+    if node.type == "Literal" and node.fields.get("kind") == "string":
+        return str(node.fields["value"])
+    if node.type == "TemplateLiteral" and not node.fields["expressions"]:
+        return "".join(node.fields["quasis"])  # type: ignore[arg-type]
+    return None
+
+
+class JsAstAnalyzer:
+    """All JS/TS rules evaluated on one parsed file. Findings are buffered and
+    flushed by the caller so an internal error can fall back cleanly."""
+
+    def __init__(self, sf: SourceFile, parsed: JsParseResult, config: Config, enabled: Set[str]) -> None:
+        self.sf = sf
+        self.ast = parsed.ast
+        self.parsed = parsed
+        self.config = config
+        self.enabled = enabled
+        self.text = sf.text
+        self.starts = js_line_starts(sf.text)
+        self.test_file = js_is_test_file(sf.rel)
+        self.findings: List[Finding] = []
+        self.functions: List[JsFunctionInfo] = []
+        self.module_own: List[JsNode] = []
+        self.all_nodes: List[JsNode] = []
+        self.const_literals: Dict[str, JsNode] = {}
+        self.module_bindings: Dict[str, Tuple[str, Optional[str]]] = {}   # local name -> (module, member)
+        self.module_sources: Set[str] = set()
+        self.async_names: Set[str] = set()
+        self.declared_names: Set[str] = set()
+        self._taint_cache: Dict[int, Set[str]] = {}
+        self._code_lines: Optional[List[str]] = None
+        self._collect()
+
+    # -- collection ---------------------------------------------------------
+    def _collect(self) -> None:
+        assert self.ast is not None
+        decl_counts: Dict[str, int] = {}
+        stack: List[Tuple[JsNode, Optional[str], str, Optional[JsFunctionInfo]]] = [(self.ast, None, "", None)]
+        pop, push = stack.pop, stack.append
+        while stack:
+            node, hint, class_name, func = pop()
+            t = node.type
+            self.all_nodes.append(node)
+            if t in _JS_FUNCTION_TYPES:
+                if t == "StaticBlock":
+                    name = (class_name + ".<static>") if class_name else "<static>"
+                else:
+                    name = node.fields.get("id") or hint or "<anonymous>"  # type: ignore[assignment]
+                info = JsFunctionInfo(node, str(name), func)
+                info.class_name = class_name
+                if func is not None:
+                    func.children.append(info)
+                self.functions.append(info)
+                if info.is_async and name not in ("<anonymous>", "default"):
+                    self.async_names.add(str(name).split(".")[-1].split(" ")[-1])
+                func = info
+            else:
+                (func.own if func is not None else self.module_own).append(node)
+            fields = node.fields
+            if t == "VariableDeclaration":
+                for d in fields["declarations"]:  # type: ignore[union-attr]
+                    ident = d.fields["id"]
+                    if ident.type == "Identifier":
+                        nm = ident.fields["name"]
+                        decl_counts[nm] = decl_counts.get(nm, 0) + 1
+                        init = d.fields.get("init")
+                        if fields["kind"] == "const" and init is not None and _js_is_literal_like(init):
+                            self.const_literals[nm] = init
+                    for nm in _js_pattern_names(ident):
+                        self.declared_names.add(nm)
+                    if func is None:
+                        self._record_module_binding(d)
+            elif t == "FunctionDeclaration" and fields.get("id"):
+                self.declared_names.add(str(fields["id"]))
+            elif t == "ImportDeclaration" and func is None:
+                self._record_import_binding(node)
+            elif t == "TSImportEqualsDeclaration" and fields.get("source") is not None:
+                self.module_sources.add(str(fields["source"].fields["value"]))
+                self.module_bindings[str(fields["id"])] = (str(fields["source"].fields["value"]), None)
+            elif t == "ClassDeclaration" or t == "ClassExpression":
+                class_name = str(fields.get("id") or hint or "")
+            elif t == "CallExpression" or t == "ImportExpression":
+                source = self._require_source(node)
+                if source is not None:
+                    self.module_sources.add(source)
+            # children with naming hints, pushed in reverse so they pop in source order
+            kids: List[Tuple[JsNode, Optional[str]]] = []
+            if t == "VariableDeclarator":
+                ident = fields["id"]
+                kids.append((ident, None))
+                init = fields.get("init")
+                if init is not None:
+                    kids.append((init, ident.fields["name"] if ident.type == "Identifier" else None))
+            elif t == "Property":
+                key = fields["key"]
+                kname = None if fields.get("computed") else str(key)
+                if fields.get("kind") in ("get", "set") and kname:
+                    kname = fields["kind"] + " " + kname
+                if isinstance(key, JsNode):
+                    kids.append((key, None))
+                kids.append((fields["value"], kname))
+            elif t == "AssignmentExpression":
+                left = fields["left"]
+                kids.append((left, None))
+                lname: Optional[str] = None
+                if fields["operator"] == "=":
+                    if left.type == "Identifier":
+                        lname = left.fields["name"]
+                    elif left.type == "MemberExpression" and not left.fields["computed"]:
+                        lname = str(left.fields["property"])
+                kids.append((fields["right"], lname))
+            elif t == "MethodDefinition" or t == "PropertyDefinition":
+                key = fields["key"]
+                kname = "[computed]" if fields.get("computed") else str(key)
+                qualified = (class_name + "." + kname) if class_name else kname
+                kind = fields.get("kind")
+                if kind in ("get", "set"):
+                    qualified = kind + " " + qualified
+                if isinstance(key, JsNode):
+                    kids.append((key, None))
+                value = fields.get("value")
+                if value is not None:
+                    kids.append((value, qualified))
+            elif t == "ExportDefaultDeclaration":
+                kids.append((fields["declaration"], "default"))
+            else:
+                for value in fields.values():
+                    if isinstance(value, JsNode):
+                        kids.append((value, None))
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, JsNode):
+                                kids.append((item, None))
+            for i in range(len(kids) - 1, -1, -1):
+                push((kids[i][0], kids[i][1], class_name, func))
+        for nm, count in decl_counts.items():
+            if count > 1:
+                self.const_literals.pop(nm, None)
+
+    def _record_import_binding(self, node: JsNode) -> None:
+        source = node.fields.get("source")
+        if source is None:
+            return
+        module = str(source.fields["value"])
+        self.module_sources.add(module)
+        for spec in node.fields["specifiers"]:  # type: ignore[union-attr]
+            local = str(spec.fields["local"])
+            if spec.type == "ImportSpecifier":
+                self.module_bindings[local] = (module, str(spec.fields["imported"]))
+            else:
+                self.module_bindings[local] = (module, None)
+
+    def _record_module_binding(self, declarator: JsNode) -> None:
+        """`const cp = require('x')`, `const { exec: run } = require('x')`, `const exec = require('x').exec`."""
+        init = declarator.fields.get("init")
+        if init is None:
+            return
+        init = _js_unwrap(init)
+        member: Optional[str] = None
+        if init.type == "MemberExpression" and not init.fields["computed"]:
+            member = str(init.fields["property"])
+            init = _js_unwrap(init.fields["object"])  # type: ignore[arg-type]
+        module = self._require_source(init)
+        if module is None:
+            return
+        self.module_sources.add(module)
+        ident = declarator.fields["id"]
+        if ident.type == "Identifier":
+            self.module_bindings[ident.fields["name"]] = (module, member)  # type: ignore[index]
+        elif ident.type == "ObjectPattern" and member is None:
+            for p in ident.fields["properties"]:  # type: ignore[union-attr]
+                if p.type != "Property" or p.fields.get("computed"):
+                    continue
+                value = p.fields["value"]
+                if value.type == "AssignmentPattern":
+                    value = value.fields["left"]
+                if value.type == "Identifier":
+                    self.module_bindings[value.fields["name"]] = (module, str(p.fields["key"]))  # type: ignore[index]
+
+    @staticmethod
+    def _require_source(node: JsNode) -> Optional[str]:
+        if node.type == "CallExpression" and node.fields["callee"].type == "Identifier" \
+                and node.fields["callee"].fields["name"] == "require" and node.fields["arguments"]:
+            return _js_string_value(node.fields["arguments"][0])  # type: ignore[index]
+        if node.type == "ImportExpression":
+            return _js_string_value(node.fields["source"])  # type: ignore[arg-type]
+        return None
+
+    def uses_module(self, modules: "frozenset[str]") -> bool:
+        return bool(self.module_sources & modules)
+
+    # -- findings -----------------------------------------------------------
+    def _finding(self, rule_id: str, severity: str, confidence: str, offset: int, message: str,
+                 remediation: Optional[str] = None) -> None:
+        line, col = js_line_col(self.starts, offset)
+        self.findings.append(Finding(rule_id, severity, confidence, self.sf.rel, line, col, message,
+                                     self.sf.snippet(line), remediation or RULES[rule_id].remediation))
+
+    def end_line(self, node: JsNode) -> int:
+        return js_line_col(self.starts, max(node.start, node.end - 1))[0]
+
+    # -- quality ------------------------------------------------------------
+    @staticmethod
+    def complexity(func: JsFunctionInfo) -> int:
+        score = 1
+        for n in func.own:
+            t = n.type
+            if t == "IfStatement" or t == "ConditionalExpression" or t == "CatchClause" or t in _JS_LOOP_TYPES:
+                score += 1
+            elif t == "LogicalExpression":
+                score += 1
+            elif t == "SwitchCase":
+                if n.fields.get("test") is not None:
+                    score += 1
+            elif t == "AssignmentExpression":
+                if n.fields["operator"] in ("&&=", "||=", "??="):
+                    score += 1
+        return score
+
+    @staticmethod
+    def max_nesting(root: JsNode, skip_root: bool) -> Tuple[int, int]:
+        """(max depth, offset of the deepest block statement) counting nested
+        if/for/while/do/switch/try; `else if` and catch/finally do not add depth."""
+        best_depth, best_pos = 0, -1
+        stack: List[Tuple[JsNode, int, bool]] = [(root, 0, False)]
+        while stack:
+            node, depth, is_else_if = stack.pop()
+            t = node.type
+            if t in _JS_FUNCTION_TYPES and node is not root:
+                continue
+            if t in _JS_NESTING_TYPES and not is_else_if:
+                depth += 1
+                if depth > best_depth:
+                    best_depth, best_pos = depth, node.start
+            kids = js_children(node)
+            for i in range(len(kids) - 1, -1, -1):
+                kid = kids[i]
+                stack.append((kid, depth, t == "IfStatement" and kid is node.fields.get("alternate") and kid.type == "IfStatement"))
+        return best_depth, best_pos
+
+    def run_quality(self) -> None:
+        th = self.config.thresholds
+        max_cc = th.get("max_cyclomatic_complexity", 10)
+        max_depth = th.get("max_nesting_depth", 4)
+        want_cc = "RS-QUAL-001" in self.enabled
+        want_depth = "RS-QUAL-002" in self.enabled
+        if (want_cc or want_depth) and not self.test_file:
+            for f in self.functions:
+                if want_cc:
+                    cc = self.complexity(f)
+                    if cc > max_cc:
+                        severity = "high" if cc > 2 * max_cc else "medium"
+                        self._finding("RS-QUAL-001", severity, "high", f.node.start,
+                                      "Function '%s' has cyclomatic complexity %d (threshold %d)" % (f.name, cc, max_cc))
+                if want_depth:
+                    depth, pos = self.max_nesting(f.node, True)
+                    if depth > max_depth and pos >= 0:
+                        self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "high", pos,
+                                      "Nesting depth %d exceeds %d in function '%s'" % (depth, max_depth, f.name))
+            if want_depth:
+                depth, pos = self.max_nesting(self.ast, True)  # type: ignore[arg-type]
+                if depth > max_depth and pos >= 0:
+                    self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "high", pos,
+                                  "Nesting depth %d exceeds %d in module scope" % (depth, max_depth))
+        if "RS-QUAL-004" in self.enabled:
+            for n in self.all_nodes:
+                if n.type == "CatchClause" and not n.fields["body"].fields["body"]:
+                    self._finding("RS-QUAL-004", RULES["RS-QUAL-004"].severity, "high", n.start,
+                                  "Empty catch block silently swallows errors")
+
+    # -- imports ------------------------------------------------------------
+    def collect_imports(self) -> List["JsImport"]:
+        found: Dict[int, JsImport] = {}
+
+        def add(source: Optional[JsNode], soft: bool) -> None:
+            if source is None:
+                return
+            spec = _js_string_value(source)
+            if not spec or "\n" in spec or source.start in found:
+                return
+            line, col = js_line_col(self.starts, source.start)
+            found[source.start] = JsImport(spec, line, col, soft, self.sf.snippet(line))
+
+        for n in self.module_own:
+            t = n.type
+            if t == "ImportDeclaration":
+                add(n.fields.get("source"), bool(n.fields.get("typeOnly")))  # type: ignore[arg-type]
+            elif t in ("ExportNamedDeclaration", "ExportAllDeclaration"):
+                add(n.fields.get("source"), bool(n.fields.get("typeOnly")))  # type: ignore[arg-type]
+            elif t == "TSImportEqualsDeclaration":
+                add(n.fields.get("source"), False)  # type: ignore[arg-type]
+            elif t == "CallExpression":
+                if self._require_source(n) is not None:
+                    add(n.fields["arguments"][0], False)  # type: ignore[index]
+            elif t == "ImportExpression":
+                add(n.fields["source"], True)  # type: ignore[arg-type]
+        for f in self.functions:
+            for n in f.own:
+                t = n.type
+                if t == "CallExpression" and self._require_source(n) is not None:
+                    add(n.fields["arguments"][0], True)  # type: ignore[index]
+                elif t == "ImportExpression":
+                    add(n.fields["source"], True)  # type: ignore[arg-type]
+        return [found[k] for k in sorted(found)]
+
+    # -- taint-lite (intra-function, flow-insensitive) ----------------------
+    def tainted_names(self, func: Optional[JsFunctionInfo]) -> Set[str]:
+        key = id(func.node) if func is not None else 0
+        cached = self._taint_cache.get(key)
+        if cached is not None:
+            return cached
+        names: Set[str] = set() if func is None else set(self.tainted_names(func.parent))
+        if func is not None:
+            for p in func.node.fields.get("params", ()):  # type: ignore[union-attr]
+                target = p.fields["left"] if p.type == "AssignmentPattern" else p
+                if target.type == "Identifier" and target.fields["name"] in _JS_TAINT_NAMES:
+                    names.add(target.fields["name"])  # type: ignore[arg-type]
+        own = self.module_own if func is None else func.own
+        for _ in range(3):
+            changed = False
+            for n in own:
+                t = n.type
+                if t == "VariableDeclarator":
+                    init = n.fields.get("init")
+                    if init is not None and self.is_tainted(init, names):
+                        for nm in _js_pattern_names(n.fields["id"]):  # type: ignore[arg-type]
+                            if nm not in names:
+                                names.add(nm)
+                                changed = True
+                elif t == "AssignmentExpression":
+                    left = n.fields["left"]
+                    if left.type == "Identifier" and left.fields["name"] not in names and self.is_tainted(n.fields["right"], names):  # type: ignore[arg-type]
+                        names.add(left.fields["name"])  # type: ignore[arg-type]
+                        changed = True
+            if not changed:
+                break
+        self._taint_cache[key] = names
+        return names
+
+    @staticmethod
+    def is_tainted(expr: JsNode, names: Set[str]) -> bool:
+        stack = [expr]
+        while stack:
+            n = stack.pop()
+            t = n.type
+            if t == "Identifier":
+                if n.fields["name"] in _JS_TAINT_NAMES or n.fields["name"] in names:
+                    return True
+                continue
+            if t in _JS_FUNCTION_TYPES:
+                continue
+            if t == "MemberExpression":
+                obj = n.fields["object"]
+                if obj.type == "Identifier" and obj.fields["name"] == "process" and not n.fields["computed"] \
+                        and n.fields["property"] in ("argv", "env"):
+                    return True
+            stack.extend(js_children(n))
+        return False
+
+    def is_constant(self, expr: Optional[JsNode]) -> bool:
+        if expr is None:
+            return True
+        stack = [expr]
+        while stack:
+            n = _js_unwrap(stack.pop())
+            t = n.type
+            if t == "Literal":
+                continue
+            if t == "TemplateLiteral":
+                if n.fields["expressions"]:
+                    stack.extend(n.fields["expressions"])  # type: ignore[arg-type]
+                continue
+            if t == "Identifier":
+                if n.fields["name"] in self.const_literals and n.fields["name"] not in _JS_TAINT_NAMES:
+                    continue
+                return False
+            if t == "BinaryExpression" and n.fields["operator"] == "+":
+                stack.append(n.fields["left"])  # type: ignore[arg-type]
+                stack.append(n.fields["right"])  # type: ignore[arg-type]
+                continue
+            if t == "UnaryExpression":
+                stack.append(n.fields["argument"])  # type: ignore[arg-type]
+                continue
+            return False
+        return True
+
+    def tier(self, expr: Optional[JsNode], func: Optional[JsFunctionInfo], levels: Tuple[str, str, str]) -> Tuple[str, str]:
+        """(severity, description) for a sink argument: tainted / untainted non-constant / constant."""
+        if self.is_constant(expr):
+            return levels[2], "constant"
+        if expr is not None and self.is_tainted(expr, self.tainted_names(func)):
+            return levels[0], "request-tainted"
+        return levels[1], "non-constant"
+
+
+def _js_is_literal_like(node: JsNode) -> bool:
+    node = _js_unwrap(node)
+    if node.type == "Literal":
+        return True
+    if node.type == "TemplateLiteral" and not node.fields["expressions"]:
+        return True
+    if node.type == "UnaryExpression" and node.fields["operator"] in ("-", "+") and _js_unwrap(node.fields["argument"]).type == "Literal":  # type: ignore[arg-type]
+        return True
+    return False
+
+
+_JS_RESOURCE_MODULES = _JS_FS_MODULES | frozenset(("net", "node:net", "tls", "node:tls", "http2", "node:http2"))
+
+
+class JsAstRules(JsAstAnalyzer):
+    """Security, async and resource rules on the AST."""
+
+    _EXEC_LEVELS = ("critical", "high", "medium")
+    _XSS_LEVELS = ("high", "medium", "low")
+
+    def run(self) -> None:
+        self.run_quality()
+        if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
+            self.run_sinks()
+        if "RS-SEC-006" in self.enabled:
+            self.run_security()
+        if self.enabled & {"RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001"} and not self.test_file:
+            self.run_async_resources()
+
+    def _scopes(self) -> Iterator[Tuple[Optional[JsFunctionInfo], List[JsNode]]]:
+        yield None, self.module_own
+        for f in self.functions:
+            yield f, f.own
+
+    # -- RS-SEC-003 / RS-SEC-004 --------------------------------------------
+    def _is_shell_exec(self, call: JsNode) -> Optional[str]:
+        """Name of the shell function when `call` runs child_process.exec/execSync (or execa/shelljs)."""
+        callee = call.fields["callee"]
+        if callee.type == "Identifier":
+            name = callee.fields["name"]
+            if name not in ("exec", "execSync"):
+                return None
+            bound = self.module_bindings.get(name)
+            if bound is not None:
+                return name if bound[0] in _JS_SHELL_MODULES else None
+            if self.uses_module(_JS_SHELL_MODULES) and name not in self.declared_names:
+                return name
+            return None
+        if callee.type == "MemberExpression" and not callee.fields["computed"]:
+            prop = str(callee.fields["property"])
+            if prop not in ("exec", "execSync"):
+                return None
+            obj = _js_unwrap(callee.fields["object"])  # type: ignore[arg-type]
+            if obj.type == "Identifier":
+                bound = self.module_bindings.get(obj.fields["name"])  # type: ignore[arg-type]
+                if bound is not None:
+                    return prop if bound[0] in _JS_SHELL_MODULES and bound[1] is None else None
+                if self.uses_module(_JS_SHELL_MODULES) and obj.fields["name"] in _JS_SHELL_PREFIXES:
+                    return prop
+                return None
+            if self._require_source(obj) in _JS_SHELL_MODULES:
+                return prop
+        return None
+
+    def _is_spawn_with_shell(self, call: JsNode) -> Optional[str]:
+        name, prop = _js_callee_name(call)
+        fn = prop or name
+        if fn not in ("spawn", "spawnSync", "execFile", "execFileSync"):
+            return None
+        if prop is None:
+            bound = self.module_bindings.get(fn)  # type: ignore[arg-type]
+            if bound is not None and bound[0] not in _JS_SHELL_MODULES:
+                return None
+        elif name is not None:
+            bound = self.module_bindings.get(name.split(".")[0])
+            if bound is not None and bound[0] not in _JS_SHELL_MODULES:
+                return None
+        if not self.uses_module(_JS_SHELL_MODULES):
+            return None
+        for arg in call.fields["arguments"]:  # type: ignore[union-attr]
+            if arg.type == "ObjectExpression":
+                for p in arg.fields["properties"]:  # type: ignore[union-attr]
+                    if p.type == "Property" and not p.fields.get("computed") and str(p.fields["key"]) == "shell":
+                        v = _js_unwrap(p.fields["value"])  # type: ignore[arg-type]
+                        if v.type == "Literal" and v.fields.get("value") is True:
+                            return fn
+        return None
+
+    def _sink(self, rule_id: str, offset: int, severity: str, message: str) -> None:
+        if self.test_file:
+            severity = _downgrade(severity)
+        self._finding(rule_id, severity, "high", offset, message)
+
+    def run_sinks(self) -> None:
+        want3 = "RS-SEC-003" in self.enabled
+        want4 = "RS-SEC-004" in self.enabled
+        for func, own in self._scopes():
+            for n in own:
+                t = n.type
+                if t == "CallExpression":
+                    args = n.fields["arguments"]
+                    first = args[0] if args else None  # type: ignore[index]
+                    if want3:
+                        shell = self._is_shell_exec(n)
+                        if shell:
+                            sev, desc = self.tier(first, func, self._EXEC_LEVELS)
+                            self._sink("RS-SEC-003", n.start, sev,
+                                       "Shell command execution via child_process.%s() with %s argument" % (shell, desc))
+                            continue
+                        spawn = self._is_spawn_with_shell(n)
+                        if spawn:
+                            sev, desc = self.tier(first, func, self._EXEC_LEVELS)
+                            self._sink("RS-SEC-003", n.start, sev,
+                                       "child_process.%s() with shell: true and %s command" % (spawn, desc))
+                            continue
+                    if not want4:
+                        continue
+                    name, prop = _js_callee_name(n)
+                    if prop is None and name == "eval" or prop == "eval" and name in ("window", "globalThis", "global", "self"):
+                        sev, desc = self.tier(first, func, self._EXEC_LEVELS)
+                        self._sink("RS-SEC-004", n.start, sev, "eval() on a %s expression" % desc)
+                    elif prop is None and name == "Function":
+                        sev, desc = self.tier(args[-1] if args else None, func, self._EXEC_LEVELS)  # type: ignore[index]
+                        self._sink("RS-SEC-004", n.start, sev, "Function() builds code from a %s string" % desc)
+                    elif (prop or name) in ("setTimeout", "setInterval") and (prop is None or name in ("window", "globalThis", "global")) and first is not None:
+                        if self._is_string_like(first, func):
+                            sev, desc = self.tier(first, func, self._EXEC_LEVELS)
+                            self._sink("RS-SEC-004", n.start, sev,
+                                       "%s() with a string argument is an implicit eval (%s)" % (prop or name, desc))
+                    elif prop in ("write", "writeln") and name == "document":
+                        sev, desc = self.tier(first, func, self._XSS_LEVELS)
+                        self._sink("RS-SEC-004", n.start, sev, "document.%s() with %s HTML (XSS sink)" % (prop, desc))
+                    elif prop == "insertAdjacentHTML":
+                        sev, desc = self.tier(args[1] if len(args) > 1 else None, func, self._XSS_LEVELS)  # type: ignore[arg-type]
+                        self._sink("RS-SEC-004", n.start, sev, "insertAdjacentHTML() injects %s HTML (XSS sink)" % desc)
+                elif t == "NewExpression" and want4:
+                    callee = n.fields["callee"]
+                    if callee.type == "Identifier" and callee.fields["name"] == "Function":
+                        args = n.fields["arguments"]
+                        sev, desc = self.tier(args[-1] if args else None, func, self._EXEC_LEVELS)  # type: ignore[index]
+                        self._sink("RS-SEC-004", n.start, sev, "new Function() builds code from a %s string" % desc)
+                elif t == "AssignmentExpression" and want4:
+                    left = n.fields["left"]
+                    if left.type == "MemberExpression" and n.fields["operator"] in ("=", "+="):
+                        prop = left.fields["property"]
+                        if left.fields["computed"]:
+                            prop = _js_string_value(prop) if isinstance(prop, JsNode) else None
+                        if prop in ("innerHTML", "outerHTML"):
+                            sev, desc = self.tier(n.fields["right"], func, self._XSS_LEVELS)  # type: ignore[arg-type]
+                            self._sink("RS-SEC-004", left.start, sev,
+                                       "Assignment to %s with %s HTML (XSS sink)" % (prop, desc))
+
+    def _is_string_like(self, expr: JsNode, func: Optional[JsFunctionInfo]) -> bool:
+        """A sink argument that is a string (literal, template, concatenation, string constant or tainted value)."""
+        e = _js_unwrap(expr)
+        if e.type == "Literal":
+            return e.fields.get("kind") == "string"
+        if e.type == "TemplateLiteral" or (e.type == "BinaryExpression" and e.fields["operator"] == "+"):
+            return True
+        if e.type == "Identifier":
+            lit = self.const_literals.get(e.fields["name"])  # type: ignore[arg-type]
+            if lit is not None:
+                return _js_string_value(lit) is not None
+            return self.is_tainted(e, self.tainted_names(func))
+        return self.is_tainted(e, self.tainted_names(func))
+
+    # -- RS-SEC-006 ---------------------------------------------------------
+    def _sec(self, severity: str, confidence: str, offset: int, message: str) -> None:
+        if self.test_file:
+            severity = _downgrade(severity)
+        self._finding("RS-SEC-006", severity, confidence, offset, message)
+
+    def _code_line_window(self, line: int) -> str:
+        if self._code_lines is None:
+            text = self.text
+            if self.parsed.comments:
+                pieces: List[str] = []
+                pos = 0
+                for a, b in self.parsed.comments:
+                    if a < pos:
+                        continue
+                    pieces.append(text[pos:a])
+                    pieces.append(_JS_NOT_NEWLINE_RE.sub(" ", text[a:b]))
+                    pos = b
+                pieces.append(text[pos:])
+                text = "".join(pieces)
+            self._code_lines = text.splitlines()
+        lines = self._code_lines
+        return "\n".join(lines[max(0, line - 4):line + 3])
+
+    @staticmethod
+    def _prop(obj: JsNode, key: str) -> Optional[JsNode]:
+        for p in obj.fields["properties"]:  # type: ignore[union-attr]
+            if p.type == "Property" and not p.fields.get("computed") and str(p.fields["key"]) == key:
+                return p
+        return None
+
+    def _is_fs_call(self, call: JsNode) -> Optional[str]:
+        name, prop = _js_callee_name(call)
+        fn = prop or name
+        if fn not in _JS_FS_PATH_METHODS:
+            return None
+        if prop is None:
+            bound = self.module_bindings.get(fn)  # type: ignore[arg-type]
+            if bound is not None:
+                return fn if bound[0] in _JS_FS_MODULES else None
+            return fn if self.uses_module(_JS_FS_MODULES) and fn not in self.declared_names else None
+        root = (name or "").split(".")[0]
+        bound = self.module_bindings.get(root)
+        if bound is not None:
+            return fn if bound[0] in _JS_FS_MODULES else None
+        if root in _JS_FS_PREFIXES and self.uses_module(_JS_FS_MODULES):
+            return fn
+        if name is None:
+            obj = _js_unwrap(call.fields["callee"].fields["object"])  # type: ignore[arg-type]
+            if self._require_source(obj) in _JS_FS_MODULES:
+                return fn
+        return None
+
+    def run_security(self) -> None:
+        for func, own in self._scopes():
+            tainted: Optional[Set[str]] = None
+            for n in own:
+                t = n.type
+                if t == "Property":
+                    if n.fields.get("computed") or n.fields.get("shorthand"):
+                        continue
+                    key = str(n.fields["key"])
+                    value = n.fields["value"]
+                    if not isinstance(value, JsNode):
+                        continue
+                    v = _js_unwrap(value)
+                    if key == "rejectUnauthorized" and v.type == "Literal" and v.fields.get("value") is False:
+                        self._sec("high", "high", n.start, "TLS certificate verification disabled with rejectUnauthorized: false")
+                    elif key == "algorithms" and v.type == "ArrayExpression":
+                        if any(el is not None and (_js_string_value(el) or "").lower() == "none" for el in v.fields["elements"]):  # type: ignore[union-attr]
+                            self._sec("high", "high", n.start, "JWT verification accepts the 'none' algorithm")
+                    elif key == "algorithm" and (_js_string_value(v) or "").lower() == "none":
+                        self._sec("high", "high", n.start, "JWT signing/verification uses the 'none' algorithm")
+                    elif key == "dangerouslySetInnerHTML" and v.type == "ObjectExpression":
+                        self._dsih(v, n.start, func)
+                elif t == "ObjectExpression":
+                    origin = self._prop(n, "origin")
+                    cred = self._prop(n, "credentials")
+                    if origin is not None and cred is not None and _js_string_value(origin.fields["value"]) == "*":  # type: ignore[arg-type]
+                        cv = _js_unwrap(cred.fields["value"])  # type: ignore[arg-type]
+                        if cv.type == "Literal" and cv.fields.get("value") is True:
+                            self._sec("medium", "high", origin.start, "CORS wildcard origin '*' combined with credentials: true")
+                elif t == "AssignmentExpression":
+                    left = n.fields["left"]
+                    if left.type == "MemberExpression":
+                        path = _js_member_path(left)
+                        if path == "process.env.NODE_TLS_REJECT_UNAUTHORIZED":
+                            v = _js_unwrap(n.fields["right"])  # type: ignore[arg-type]
+                            if _js_string_value(v) == "0" or (v.type == "Literal" and v.fields.get("value") == "0"):
+                                self._sec("high", "high", n.start, "TLS certificate verification disabled via NODE_TLS_REJECT_UNAUTHORIZED='0'")
+                elif t == "CallExpression":
+                    name, prop = _js_callee_name(n)
+                    fn = prop or name
+                    args = n.fields["arguments"]
+                    if fn == "createHash" and args:
+                        algo = _js_string_value(args[0])  # type: ignore[index]
+                        if algo is None and args[0].type == "Identifier":  # type: ignore[index]
+                            algo = _js_string_value(self.const_literals.get(args[0].fields["name"]))  # type: ignore[index]
+                        if algo and algo.strip().lower() in ("md5", "sha1", "sha-1"):
+                            self._sec("medium", "high", n.start,
+                                      "Weak hash createHash('%s'); unsuitable for passwords or signatures (fine for non-security checksums)"
+                                      % algo.strip().lower())
+                    elif prop == "random" and name == "Math":
+                        line = js_line_col(self.starts, n.start)[0]
+                        ident = _JS_SECRET_IDENT_RE.search(self._code_line_window(line))
+                        if ident:
+                            self._sec("medium", "medium", n.start,
+                                      "Math.random() used near '%s'; not cryptographically secure" % ident.group(0))
+                    elif args and fn in _JS_FS_PATH_METHODS:
+                        fs_fn = self._is_fs_call(n)
+                        if fs_fn:
+                            if tainted is None:
+                                tainted = self.tainted_names(func)
+                            if self.is_tainted(args[0], tainted):  # type: ignore[index]
+                                self._sec("medium", "high", n.start,
+                                          "fs.%s() path built from request data (possible path traversal)" % fs_fn)
+                elif t == "NewExpression":
+                    callee = n.fields["callee"]
+                    args = n.fields["arguments"]
+                    if callee.type == "Identifier" and callee.fields["name"] == "RegExp" and args:
+                        if tainted is None:
+                            tainted = self.tainted_names(func)
+                        if self.is_tainted(args[0], tainted):  # type: ignore[index]
+                            self._sec("low", "high", n.start, "new RegExp() built from request data (ReDoS / pattern injection)")
+                elif t == "JSXAttribute" and n.fields.get("name") == "dangerouslySetInnerHTML":
+                    value = n.fields.get("value")
+                    if value is not None and value.type == "JSXExpressionContainer" and value.fields.get("expression") is not None:
+                        obj = _js_unwrap(value.fields["expression"])  # type: ignore[arg-type]
+                        if obj.type == "ObjectExpression":
+                            self._dsih(obj, n.start, func)
+
+    def _dsih(self, obj: JsNode, offset: int, func: Optional[JsFunctionInfo]) -> None:
+        html = self._prop(obj, "__html")
+        if html is None:
+            return
+        sev, desc = self.tier(html.fields["value"], func, self._XSS_LEVELS)  # type: ignore[arg-type]
+        if desc == "constant":
+            self._sec("low", "high", offset, "dangerouslySetInnerHTML with a constant string")
+        else:
+            self._sec(sev, "high", offset, "dangerouslySetInnerHTML with %s __html (XSS sink)" % desc)
+
+    # -- RS-ASYNC-001 / RS-ASYNC-002 / RS-RES-001 ----------------------------
+    def run_async_resources(self) -> None:
+        want1 = "RS-ASYNC-001" in self.enabled
+        want2 = "RS-ASYNC-002" in self.enabled
+        wantr = "RS-RES-001" in self.enabled
+        for func, own in self._scopes():
+            is_async = func is not None and (func.is_async or any(n.type == "AwaitExpression" for n in own))
+            for n in own:
+                t = n.type
+                if t == "CallExpression":
+                    name, prop = _js_callee_name(n)
+                    fn = prop or name
+                    if want1 and is_async:
+                        if fn in _JS_SYNC_BLOCKING:
+                            label = (name.split(".")[-1] + "." + prop) if (prop and name) else str(fn)
+                            self._finding("RS-ASYNC-001", RULES["RS-ASYNC-001"].severity, "high", n.start,
+                                          "Blocking call %s() inside async function '%s' stalls the event loop" % (label, func.name),  # type: ignore[union-attr]
+                                          "Use the promise-based API (fs.promises.*, util.promisify(child_process.exec), crypto.pbkdf2 "
+                                          "with a callback/promise) or move the work to a worker thread.")
+                        elif prop == "wait" and name == "Atomics":
+                            self._finding("RS-ASYNC-001", RULES["RS-ASYNC-001"].severity, "high", n.start,
+                                          "Atomics.wait() inside async function '%s' blocks the thread" % func.name)  # type: ignore[union-attr]
+                    if want2 and prop == "forEach":
+                        args = n.fields["arguments"]
+                        if args and args[0].type in _JS_FUNCTION_TYPES and args[0].fields.get("async"):  # type: ignore[index]
+                            self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "high", n.start,
+                                          "forEach(async ...) does not wait for its callbacks; errors and ordering are lost",
+                                          "Use `await Promise.all(items.map(async ...))` or a `for...of` loop with await.")
+                    if wantr and fn == "setInterval" and prop is None and self._is_discarded_statement(n, own):
+                        self._finding("RS-RES-001", RULES["RS-RES-001"].severity, "high", n.start,
+                                      "setInterval() handle is discarded, so the timer can never be cleared",
+                                      "Keep the handle and clearInterval() it when done.")
+                elif t == "ExpressionStatement" and want2:
+                    self._check_floating(n)
+                elif t == "VariableDeclarator" and wantr:
+                    self._check_resource(n, func)
+
+    @staticmethod
+    def _is_discarded_statement(call: JsNode, own: List[JsNode]) -> bool:
+        for n in own:
+            if n.type == "ExpressionStatement" and n.fields["expression"] is call:
+                return True
+        return False
+
+    def _check_floating(self, stmt: JsNode) -> None:
+        expr = stmt.fields["expression"]
+        if expr.type != "CallExpression":
+            return
+        # method calls applied to the root call (`fetch(u).then(a).catch(b)` -> [then, catch] above root fetch(u))
+        chain: List[Tuple[str, int]] = []   # (method name, argument count), outermost first
+        root = expr
+        while True:
+            callee = root.fields["callee"]
+            if callee.type == "MemberExpression" and not callee.fields["computed"]:
+                inner = _js_unwrap(callee.fields["object"])  # type: ignore[arg-type]
+                if inner.type == "CallExpression":
+                    chain.append((str(callee.fields["property"]), len(root.fields["arguments"])))  # type: ignore[arg-type]
+                    root = inner
+                    continue
+            break
+        methods = [m for m, _ in chain]
+        if "catch" in methods:
+            return
+        if chain and chain[0][0] == "then" and chain[0][1] >= 2:
+            return
+        name, prop = _js_callee_name(root)
+        if "then" in methods or (prop == "then" and not chain and len(root.fields["arguments"]) < 2):  # type: ignore[arg-type]
+            self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "high", stmt.start,
+                          "Promise chain with .then() has no .catch(); a rejection becomes an unhandled rejection",
+                          "Add `.catch(...)`, or `await` the promise inside try/catch.")
+            return
+        if chain:
+            return  # some other method applied to the result (e.g. `.finally()` alone)
+        what: Optional[str] = None
+        if prop is None and name is not None:
+            if name in self.async_names:
+                what = "async function '%s'" % name
+            elif name == "fetch":
+                what = "fetch()"
+        elif prop is not None:
+            if name == "this" and prop in self.async_names:
+                what = "async method '%s'" % prop
+            elif name == "Promise" and prop in ("all", "allSettled", "race", "any"):
+                what = "Promise.%s()" % prop
+            elif name is not None and name.endswith(".promises") or name == "promises":
+                what = "%s.%s()" % (name, prop)
+        if what:
+            self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "high", stmt.start,
+                          "Promise from %s is neither awaited, returned nor given .catch(); rejections are lost" % what,
+                          "`await` it, return it, add `.catch(...)`, or mark intentional fire-and-forget with `void`.")
+
+    def _resource_kind(self, init: JsNode) -> Optional[str]:
+        init = _js_unwrap(init)
+        if init.type == "CallExpression":
+            name, prop = _js_callee_name(init)
+            if prop is None:
+                if name == "setInterval":
+                    return "setInterval"
+                if name in ("createWriteStream", "createReadStream"):
+                    bound = self.module_bindings.get(name)
+                    if bound is None and not self.uses_module(_JS_FS_MODULES):
+                        return None
+                    return name
+                return None
+            if prop in _JS_RESOURCE_METHODS and name is not None:
+                root = name.split(".")[0]
+                bound = self.module_bindings.get(root)
+                if bound is not None:
+                    return prop if bound[0] in _JS_RESOURCE_MODULES else None
+                if root in _JS_RESOURCE_ROOTS:
+                    return prop
+            return None
+        if init.type == "NewExpression":
+            callee = init.fields["callee"]
+            if callee.type == "Identifier" and callee.fields["name"] in ("WebSocket", "Socket"):
+                return callee.fields["name"]  # type: ignore[return-value]
+            if callee.type == "MemberExpression" and not callee.fields["computed"] and callee.fields["property"] == "Socket":
+                return "Socket"
+        return None
+
+    def _check_resource(self, decl: JsNode, func: Optional[JsFunctionInfo]) -> None:
+        init = decl.fields.get("init")
+        ident = decl.fields["id"]
+        if init is None or ident.type != "Identifier":
+            return
+        kind = self._resource_kind(init)
+        if kind is None:
+            return
+        var = ident.fields["name"]
+        scope_root = func.node if func is not None else self.ast
+        if self._is_released(var, kind, scope_root, decl):  # type: ignore[arg-type]
+            return
+        if kind == "setInterval":
+            message = "Timer from setInterval() assigned to '%s' is never cleared with clearInterval()" % var
+            remediation = "Keep the handle and clearInterval() it when done."
+        else:
+            message = "Resource from %s() assigned to '%s' is never closed, ended, piped, returned or stored" % (kind, var)
+            remediation = "Close it in a `finally` block (or with `using`), or pass it to stream.pipeline()."
+        self._finding("RS-RES-001", RULES["RS-RES-001"].severity, "high", ident.start, message, remediation)
+
+    @staticmethod
+    def _is_released(var: str, kind: str, scope_root: JsNode, decl: JsNode) -> bool:
+        """True when `var` is closed, cleared, piped, returned, awaited later, or escapes
+        (argument, property value, array element, field assignment, export) anywhere in the scope."""
+        readable = kind == "createReadStream"
+        stack = [scope_root]
+        while stack:
+            n = stack.pop()
+            if n is decl:
+                continue
+            t = n.type
+            f = n.fields
+            if t == "CallExpression":
+                callee = f["callee"]
+                if callee.type == "MemberExpression" and not callee.fields["computed"]:
+                    obj = callee.fields["object"]
+                    prop = str(callee.fields["property"])
+                    if obj.type == "Identifier" and obj.fields["name"] == var:
+                        if prop in _JS_RELEASE_METHODS or (readable and prop in _JS_READ_CONSUME_METHODS):
+                            return True
+                for arg in f["arguments"]:  # type: ignore[union-attr]
+                    a = _js_unwrap(arg) if arg.type != "SpreadElement" else arg
+                    if a.type == "Identifier" and a.fields["name"] == var:
+                        return True
+            elif t == "ReturnStatement" or t == "YieldExpression" or t == "AwaitExpression":
+                arg = f.get("argument")
+                if arg is not None and _js_unwrap(arg).type == "Identifier" and _js_unwrap(arg).fields["name"] == var:
+                    return True
+            elif t == "AssignmentExpression":
+                right = _js_unwrap(f["right"])  # type: ignore[arg-type]
+                if right.type == "Identifier" and right.fields["name"] == var and f["left"].type == "MemberExpression":
+                    return True
+            elif t == "Property" and not f.get("computed"):
+                v = f["value"]
+                if isinstance(v, JsNode) and v.type == "Identifier" and v.fields["name"] == var:
+                    return True
+            elif t == "ArrayExpression":
+                for el in f["elements"]:  # type: ignore[union-attr]
+                    if el is not None and el.type == "Identifier" and el.fields["name"] == var:
+                        return True
+            elif t == "ExportNamedDeclaration":
+                for spec in f.get("specifiers", ()):  # type: ignore[union-attr]
+                    if spec.fields.get("local") == var:
+                        return True
+            elif t == "ForOfStatement" and readable:
+                right = _js_unwrap(f["right"])  # type: ignore[arg-type]
+                if right.type == "Identifier" and right.fields["name"] == var:
+                    return True
+            stack.extend(js_children(n))
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -6076,10 +7095,36 @@ class Scanner:
                 scan_pattern_sinks(sf, self._emit)
 
     def _scan_js(self, sf: SourceFile) -> None:
-        """JS/TS: masked-text structural rules, sinks and (later) imports.
+        """JS/TS: parse once and run every rule on the AST; files the parser
+        cannot handle (or REPO_SENTRY_JS_PARSER=0) use the heuristic path.
         Declaration files and minified/bundled files only get secret scanning."""
         if js_is_declaration_file(sf.rel) or is_minified(sf.rel, sf.lines):
             return
+        want_graph = "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled
+        if js_parser_enabled():
+            parsed = js_parse(sf.text, sf.rel)
+            if parsed.ok:
+                try:
+                    analyzer = JsAstRules(sf, parsed, self.config, self.enabled)
+                    analyzer.run()
+                    imports = analyzer.collect_imports() if want_graph else []
+                except Exception as exc:  # never crash: fall back to the heuristic path
+                    reason = "internal error in the AST analyser: %s: %s" % (type(exc).__name__, exc)
+                else:
+                    for finding in analyzer.findings:
+                        self._emit(finding)
+                    if want_graph:
+                        self.js_modules.append(JsModule(sf.rel, imports))
+                    if parsed.errors:
+                        line, col, msg = parsed.errors[0]
+                        self._sys_finding(sf.rel, line, "JS/TS file parsed with %d syntax error%s (first at line %d col %d: %s); "
+                                          "analysed from the recovered AST"
+                                          % (len(parsed.errors), "" if len(parsed.errors) == 1 else "s", line, col, msg))
+                    return
+            else:
+                reason = parsed.reason
+            line = parsed.errors[0][0] if parsed.errors else 1
+            self._sys_finding(sf.rel, line, "JS/TS parser fell back to the heuristic path (%s)" % reason)
         try:
             analyzer = JsAnalyzer(sf, self.config, self._emit, self.enabled)
         except (RecursionError, MemoryError, ValueError, IndexError) as exc:
@@ -6097,7 +7142,7 @@ class Scanner:
             analyzer.run_async_resources()
         if "RS-SEC-006" in self.enabled:
             analyzer.run_security()
-        if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
+        if want_graph:
             self.js_modules.append(JsModule(sf.rel, analyzer.collect_imports()))
 
     def _report_js_graph(self) -> None:
@@ -6419,11 +7464,15 @@ def render_rule_catalog() -> str:
         out.append("    languages: %s" % rule.languages)
         out.append("    %s" % rule.description)
     out.append("")
-    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript files are lexically")
-    out.append("masked (comments, strings, template text, regex literals and JSX text blanked) and analysed")
-    out.append("approximately: brace-matched function discovery feeds RS-QUAL-001/002/004, a relative-import")
-    out.append("graph with tsconfig/jsconfig path aliases feeds RS-ARCH-001/002, and RS-SEC-003/004/006 are")
-    out.append("pattern-based on the masked code. JS/TS findings carry confidence low or medium. C/C++ and")
+    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript files are parsed with the")
+    out.append("built-in ES2023/TypeScript parser (parser-based, with heuristic fallback): function discovery,")
+    out.append("RS-QUAL-001/002/004, the import graph (RS-ARCH-001/002), the sinks RS-SEC-003/004/006 and")
+    out.append("RS-ASYNC-001/002, RS-RES-001 run on the AST with confidence high. Sink severities use intra-function,")
+    out.append("flow-insensitive taint-lite (req/request/ctx/params/query/body/argv/process.argv/process.env):")
+    out.append("tainted arguments keep the top severity, untainted non-constant arguments are one level lower,")
+    out.append("constants two. A file the parser cannot handle (too many syntax errors, nesting deeper than 400,")
+    out.append("or REPO_SENTRY_JS_PARSER=0) falls back to the lexically masked, pattern-based heuristics with")
+    out.append("confidence low or medium and messages marked approximate, plus one RS-SYS-001. C/C++ and")
     out.append("shell files are scanned with regular-expression patterns only (RS-SEC-003, RS-SEC-004 and")
     out.append("the secret rules); those findings also carry confidence low or medium.")
     out.append("Suppress a finding with a comment `reposentry: ignore RS-XXX-NNN` on the same or the")
@@ -6568,6 +7617,12 @@ class _ProjectMixin:
     @staticmethod
     def by_rule(findings: Sequence[Finding], rule_id: str) -> List[Finding]:
         return [f for f in findings if f.rule_id == rule_id]
+
+    @staticmethod
+    def heuristics_only():
+        """Context manager forcing the pre-parser heuristic path (REPO_SENTRY_JS_PARSER=0)."""
+        from unittest import mock
+        return mock.patch.dict(os.environ, {"REPO_SENTRY_JS_PARSER": "0"})
 
     @staticmethod
     def run_cli(argv: Sequence[str]) -> Tuple[int, str, str]:
@@ -7033,7 +8088,21 @@ class TestInjectionSinks(_ProjectMixin, unittest.TestCase):
         src = ("const { exec } = require('child_process');\n// exec(userInput) in a comment\n"
                "exec(userInput);\nexec('ls -la');\neval(code);\nconst f = new Function(body);\n"
                "setTimeout('doIt()', 10);\nel.innerHTML = userHtml;\nif (a == b) {}\n")
+        # AST path (v1.4): userInput/code/body/userHtml are free identifiers, i.e. untainted non-constants,
+        # one level below the tainted severity (critical -> high for exec/eval/Function, high -> medium for innerHTML).
         findings = self.scan_files({"a.js": src})
+        sinks = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertNotIn((2, "RS-SEC-003"), sinks)
+        self.assertEqual(sinks[(3, "RS-SEC-003")], "high")
+        self.assertEqual(sinks[(4, "RS-SEC-003")], "medium")
+        self.assertEqual(sinks[(5, "RS-SEC-004")], "high")
+        self.assertEqual(sinks[(6, "RS-SEC-004")], "critical")  # `body` is a taint-source name (request body)
+        self.assertEqual(sinks[(7, "RS-SEC-004")], "medium")
+        self.assertEqual(sinks[(8, "RS-SEC-004")], "medium")
+        self.assertTrue(all(f.confidence == "high" for f in findings if f.file == "a.js"))
+        # heuristic fallback path: the original pattern-based expectations are unchanged
+        with self.heuristics_only():
+            findings = self.scan_files({"a.js": src})
         sinks = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
         self.assertNotIn((2, "RS-SEC-003"), sinks)
         self.assertEqual(sinks[(3, "RS-SEC-003")], "critical")
@@ -7418,9 +8487,14 @@ class TestJsStructure(_ProjectMixin, unittest.TestCase):
         hits = self.by_rule(findings, "RS-QUAL-001")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].severity, "medium")
-        self.assertEqual(hits[0].confidence, "medium")
-        self.assertIn("approximate", hits[0].message)
+        self.assertEqual(hits[0].confidence, "high")  # AST path (v1.4): exact McCabe, no longer approximate
+        self.assertNotIn("approximate", hits[0].message)
+        self.assertIn("complexity 13", hits[0].message)
         self.assertEqual(hits[0].line, 1)
+        with self.heuristics_only():
+            hits = self.by_rule(self.scan_files({"a.js": src}), "RS-QUAL-001")
+        self.assertEqual((len(hits), hits[0].severity, hits[0].confidence, hits[0].line), (1, "medium", "medium", 1))
+        self.assertIn("approximate", hits[0].message)
         findings = self.scan_files({"a.js": src}, {"thresholds": {"max_cyclomatic_complexity": 5}})
         self.assertEqual(self.by_rule(findings, "RS-QUAL-001")[0].severity, "high")
 
@@ -7446,6 +8520,10 @@ class TestJsStructure(_ProjectMixin, unittest.TestCase):
                "try { d(); } catch (e) { /* nothing */ }\n")
         findings = self.scan_files({"a.js": src})
         hits = self.by_rule(findings, "RS-QUAL-004")
+        self.assertEqual(sorted(f.line for f in hits), [1, 2, 6])
+        self.assertTrue(all(f.severity == "medium" and f.confidence == "high" for f in hits))  # AST path (v1.4)
+        with self.heuristics_only():
+            hits = self.by_rule(self.scan_files({"a.js": src}), "RS-QUAL-004")
         self.assertEqual(sorted(f.line for f in hits), [1, 2, 6])
         self.assertTrue(all(f.severity == "medium" and f.confidence == "medium" for f in hits))
 
@@ -7538,7 +8616,19 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
                "el.innerHTML = \"<b>\";\n"                       # 8 medium
                "exec(`rm -rf ${dir}`);\n"                        # 9 critical
                "exec('ls' + dir);\n")                            # 10 critical
+        # AST path (v1.4): userInput, x and dir are untainted non-constants (one level below tainted);
+        # constants are two levels below (exec: medium, innerHTML: low).
         findings = self.scan_files({"a.js": src})
+        sev = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertEqual(sev, {(2, "RS-SEC-003"): "high", (3, "RS-SEC-003"): "medium", (4, "RS-SEC-004"): "high",
+                               (7, "RS-SEC-004"): "medium", (8, "RS-SEC-004"): "low", (9, "RS-SEC-003"): "high",
+                               (10, "RS-SEC-003"): "high"})
+        self.assertTrue(SEVERITY_RANK[sev[(8, "RS-SEC-004")]] < SEVERITY_RANK[sev[(7, "RS-SEC-004")]])
+        tainted = src.replace("exec(userInput)", "exec(req.query.cmd)").replace("eval(x)", "eval(req.body.code)")
+        sev = {(f.line, f.rule_id): f.severity for f in self.scan_files({"a.js": tainted}) if f.rule_id.startswith("RS-SEC-00")}
+        self.assertEqual((sev[(2, "RS-SEC-003")], sev[(4, "RS-SEC-004")]), ("critical", "critical"))
+        with self.heuristics_only():
+            findings = self.scan_files({"a.js": src})
         sev = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
         self.assertEqual(sev, {(2, "RS-SEC-003"): "critical", (3, "RS-SEC-003"): "medium", (4, "RS-SEC-004"): "critical",
                                (7, "RS-SEC-004"): "high", (8, "RS-SEC-004"): "medium", (9, "RS-SEC-003"): "critical",
@@ -7557,6 +8647,13 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
                "      <p dangerouslySetInnerHTML={{__html: \"<b>static</b>\"}} />\n    </div>\n  );\n}\n")
         findings = self.scan_files({"view.jsx": src})
         hits = sorted((f.line, f.severity) for f in self.by_rule(findings, "RS-SEC-006"))
+        # AST path (v1.4): `html` is a destructured prop, not request data -> untainted non-constant -> medium
+        self.assertEqual(hits, [(4, "medium"), (5, "low")])
+        tainted = src.replace("{ __html: html }", "{ __html: req.query.html }")
+        self.assertEqual(sorted((f.line, f.severity) for f in self.by_rule(self.scan_files({"view.jsx": tainted}), "RS-SEC-006")),
+                         [(4, "high"), (5, "low")])
+        with self.heuristics_only():
+            hits = sorted((f.line, f.severity) for f in self.by_rule(self.scan_files({"view.jsx": src}), "RS-SEC-006"))
         self.assertEqual(hits, [(4, "high"), (5, "low")])
 
     SEC006 = (
@@ -7597,6 +8694,15 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
         self.assertEqual(hits, {4: "high", 6: "high", 9: "medium", 11: "medium", 21: "high", 23: "medium",
                                 26: "medium", 28: "medium", 29: "low"})
+        # AST path (v1.4): confidence high (Math.random proximity stays medium), no "approximate"
+        self.assertEqual({f.line: f.confidence for f in self.by_rule(findings, "RS-SEC-006")},
+                         {4: "high", 6: "high", 9: "high", 11: "medium", 21: "high", 23: "high", 26: "high", 28: "high", 29: "high"})
+        self.assertFalse(any("approximate" in f.message for f in self.by_rule(findings, "RS-SEC-006")))
+        with self.heuristics_only():
+            findings = self.scan_files({"server.js": self.SEC006})
+        hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(hits, {4: "high", 6: "high", 9: "medium", 11: "medium", 21: "high", 23: "medium",
+                                26: "medium", 28: "medium", 29: "low"})
         self.assertTrue(all(f.confidence in ("low", "medium") and "approximate" in f.message
                             for f in self.by_rule(findings, "RS-SEC-006")))
 
@@ -7616,6 +8722,12 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         code = "import { exec } from 'child_process';\nexec(userInput);\neval(x);\nexec('ls');\n"
         real = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.js": code})}
         test = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.test.js": code})}
+        # AST path (v1.4): untainted non-constant arguments are high (one below critical); test files one lower again
+        self.assertEqual(real, {("RS-SEC-003", 2): "high", ("RS-SEC-004", 3): "high", ("RS-SEC-003", 4): "medium"})
+        self.assertEqual(test, {("RS-SEC-003", 2): "medium", ("RS-SEC-004", 3): "medium", ("RS-SEC-003", 4): "low"})
+        with self.heuristics_only():
+            real = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.js": code})}
+            test = {(f.rule_id, f.line): f.severity for f in self.scan_files({"a.test.js": code})}
         self.assertEqual(real, {("RS-SEC-003", 2): "critical", ("RS-SEC-004", 3): "critical", ("RS-SEC-003", 4): "medium"})
         self.assertEqual(test, {("RS-SEC-003", 2): "high", ("RS-SEC-004", 3): "high", ("RS-SEC-003", 4): "low"})
 
@@ -7623,24 +8735,36 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         code, out, _ = self.run_cli(["--list-rules"])
         self.assertEqual(code, 0)
         self.assertIn("RS-SEC-006", out)
-        self.assertIn("JS/TS: pattern-based, approximate", out)
+        self.assertIn("JS/TS: parser-based, with heuristic fallback", out)
+        self.assertIn("pattern-based, approximate", out)
 
 
 class TestJsAsyncAndResources(_ProjectMixin, unittest.TestCase):
     FIXTURE = 'const fs = require(\'fs\');\nconst net = require(\'net\');\nasync function save(x) { await fs.promises.writeFile(\'a\', x); }\nasync function load() {\n  const d = fs.readFileSync(\'a\');            // L5 blocking\n  const e = await fs.promises.readFile(\'a\'); // ok\n  function inner() { return fs.readFileSync(\'b\'); } // sync nested: ok\n  return d;\n}\nconst arrow = async () => { execSync(\'ls\'); };      // L10 blocking\nfunction sync() { return fs.readFileSync(\'c\'); }    // ok (not async)\nasync function main(items) {\n  save(1);                                  // L13 floating\n  await save(2);                            // ok\n  void save(3);                             // ok\n  save(4).catch(console.error);             // ok\n  return save(5);                           // ok\n  items.forEach(async (i) => { await save(i); }); // L17\n  fetch(\'/x\');                              // L18 floating\n  fetch(\'/y\').then(r => r.json());          // L19 then w/o catch\n  fetch(\'/z\').then(r => r.json()).catch(e => e); // ok\n  Promise.all([save(1)]);                   // L21\n  await Promise.all([save(1)]);             // ok\n  const p = save(6);                        // ok (assigned: not flagged by design)\n  // save(7);  "save(8)";\n}\nconst w = fs.createWriteStream(\'out.txt\');          // L26 never closed\nconst ok1 = fs.createWriteStream(\'o2.txt\'); ok1.end();\nconst ok2 = fs.createWriteStream(\'o3.txt\'); src.pipe(ok2);\nconst sock = net.createConnection(80);              // L29 never closed\nconst ok3 = new WebSocket(u); ok3.close();\nconst rs = fs.createReadStream(\'r\');                // read streams: not flagged\n'
 
-    def _hits(self, rel):
-        findings = self.scan_files({rel: self.FIXTURE})
+    def _hits(self, rel, heuristics=False):
+        if heuristics:
+            with self.heuristics_only():
+                findings = self.scan_files({rel: self.FIXTURE})
+        else:
+            findings = self.scan_files({rel: self.FIXTURE})
         return sorted((f.rule_id, f.line) for f in findings if f.rule_id in ("RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001"))
 
+    EXPECTED = [
+        ("RS-ASYNC-001", 5), ("RS-ASYNC-001", 10),                       # *Sync inside async (nested sync fn and sync fn are fine)
+        ("RS-ASYNC-002", 13), ("RS-ASYNC-002", 18), ("RS-ASYNC-002", 19), ("RS-ASYNC-002", 20), ("RS-ASYNC-002", 22),
+        ("RS-RES-001", 27), ("RS-RES-001", 30)]                          # unclosed write stream and socket
+
     def test_expected_findings(self):
-        self.assertEqual(self._hits("a.js"), [
-            ("RS-ASYNC-001", 5), ("RS-ASYNC-001", 10),                       # *Sync inside async (nested sync fn and sync fn are fine)
-            ("RS-ASYNC-002", 13), ("RS-ASYNC-002", 18), ("RS-ASYNC-002", 19), ("RS-ASYNC-002", 20), ("RS-ASYNC-002", 22),
-            ("RS-RES-001", 27), ("RS-RES-001", 30)])                         # unclosed write stream and socket
+        # AST path (v1.4): the read stream on line 32 is never consumed, piped or closed, so it is a leak too
+        self.assertEqual(self._hits("a.js"), self.EXPECTED + [("RS-RES-001", 32)])
+        self.assertEqual(self._hits("a.js", heuristics=True), self.EXPECTED)
 
     def test_not_flagged(self):
         lines = {line for _, line in self._hits("a.js")}
+        for ok in (6, 7, 11, 14, 15, 16, 17, 21, 23, 24, 25, 28, 29, 31):
+            self.assertNotIn(ok, lines, "line %d should not be flagged" % ok)
+        lines = {line for _, line in self._hits("a.js", heuristics=True)}
         for ok in (6, 7, 11, 14, 15, 16, 17, 21, 23, 24, 25, 28, 29, 31, 32):
             self.assertNotIn(ok, lines, "line %d should not be flagged" % ok)
 
@@ -7734,6 +8858,18 @@ class TestJsRobustnessAndCli(_ProjectMixin, unittest.TestCase):
         started = _time.time()
         result = scan(root)
         self.assertLess(_time.time() - started, 5.0)
+        # AST path (v1.4): the unterminated template is recovered (one RS-SYS-001 [low]); parens.js, oneline.js
+        # and braces.js are single lines over 2000 characters, i.e. minified, and skip structural analysis.
+        sys_findings = self.by_rule(result.findings, "RS-SYS-001")
+        self.assertEqual(sorted(f.file for f in sys_findings), ["template.js"])
+        self.assertIn("parsed with 1 syntax error", sys_findings[0].message)
+        self.assertTrue(all(f.severity == "low" for f in sys_findings))
+        self.assertEqual([f.file for f in self.by_rule(result.findings, "RS-SEC-004")], ["template.js"])
+        self.assertEqual(result.scanned_files, 4)
+        with self.heuristics_only():
+            started = _time.time()
+            result = scan(root)
+        self.assertLess(_time.time() - started, 5.0)
         self.assertEqual(self.by_rule(result.findings, "RS-SYS-001"), [])
         self.assertEqual(result.scanned_files, 4)
 
@@ -7747,7 +8883,14 @@ class TestJsRobustnessAndCli(_ProjectMixin, unittest.TestCase):
                 raise ValueError("synthetic tokenizer failure")
             return original(text, jsx)
 
-        with mock.patch.dict(globals(), {"js_mask": boom}):
+        real_parse = js_parse
+
+        def parser_gives_up(text, rel="file.js"):
+            if "const a" in text:
+                return JsParseResult(None, [], [], True, "synthetic parser failure", 1)
+            return real_parse(text, rel)
+
+        with mock.patch.dict(globals(), {"js_mask": boom, "js_parse": parser_gives_up}):
             findings = scan(root).findings
         self.assertEqual([f.file for f in self.by_rule(findings, "RS-SYS-001")], ["bad.js"])
         self.assertEqual(self.by_rule(findings, "RS-SYS-001")[0].severity, "low")
@@ -8093,6 +9236,440 @@ class TestJsParser(unittest.TestCase):
         self.assertEqual(len(funcs), 12)
         arrow = result.ast.body[3].declarations[0].init
         self.assertEqual((arrow.line, src.count("\n", 0, arrow.end) + 1), (4, 6))
+
+
+
+class TestJsAstAnalysis(_ProjectMixin, unittest.TestCase):
+    """Acceptance tests for the parser-based JS/TS rules (v1.4)."""
+
+    @staticmethod
+    def analyze(src: str, rel: str = "a.js", config: Optional[Dict[str, object]] = None) -> "JsAstRules":
+        parsed = js_parse(src, rel)
+        assert parsed.ok, parsed.reason
+        cfg, _ = config_from_dict(config or {})
+        analyzer = JsAstRules(SourceFile(rel, rel, src, "js"), parsed, cfg, set(RULES))
+        analyzer.run()
+        return analyzer
+
+    def test_syntax_error_mid_file_recovers_and_reports_sys_finding(self):
+        src = ("const { exec } = require('child_process');\n"
+               "function before(req) {\n  exec(req.query.a);\n}\n"
+               "const broken = { a: 1, b: , c: 3 };\n"
+               "function after(req) {\n  exec(req.query.b);\n}\n")
+        root = self.make_project({"a.js": src})
+        result = scan(root)
+        sys_hits = self.by_rule(result.findings, "RS-SYS-001")
+        self.assertEqual([(f.line, f.severity) for f in sys_hits], [(5, "low")])
+        self.assertIn("parsed with 1 syntax error", sys_hits[0].message)
+        self.assertEqual([(f.line, f.severity) for f in self.by_rule(result.findings, "RS-SEC-003")], [(3, "critical"), (7, "critical")])
+        names = [f.name for f in self.analyze(src).functions]
+        self.assertEqual(names, ["before", "after"])
+
+    def test_garbage_file_falls_back_to_heuristics(self):
+        garbage = "}{)(][ ;; ??? ::: ,,\n" * 200 + "eval(x);\n"
+        result = scan(self.make_project({"junk.js": garbage, "ok.js": "const a = 1;\n"}))
+        sys_hits = self.by_rule(result.findings, "RS-SYS-001")
+        self.assertEqual([f.file for f in sys_hits], ["junk.js"])
+        self.assertIn("fell back to the heuristic path", sys_hits[0].message)
+        self.assertEqual(sys_hits[0].severity, "low")
+        evals = self.by_rule(result.findings, "RS-SEC-004")
+        self.assertEqual([(f.file, f.confidence) for f in evals], [("junk.js", "medium")])
+        self.assertEqual(result.scanned_files, 2)
+
+    def test_function_discovery_names_and_line_ranges(self):
+        src = ("function decl(a) {\n  return a;\n}\n"                     # 1-3
+               "async function fetchIt() {\n  await x;\n}\n"               # 4-6
+               "function* gen() {\n  yield 1;\n}\n"                        # 7-9
+               "const arrow = (a) => {\n  return a;\n};\n"                 # 10-12
+               "export default () => {\n  run();\n};\n"                    # 13-15
+               "class K extends Base {\n"                                  # 16
+               "  method(v) {\n    return v;\n  }\n"                       # 17-19
+               "  static load(id) {\n    return id;\n  }\n"                # 20-22
+               "  get value() {\n    return 1;\n  }\n"                     # 23-25
+               "  set value(v) {\n    this.v = v;\n  }\n"                  # 26-28
+               "  constructor(v) {\n    super();\n  }\n"                   # 29-31
+               "}\n"                                                       # 32
+               "const obj = {\n  handler(e) {\n    return e;\n  },\n};\n"  # 33-37 (method 34-36)
+               "items.map(function (x) {\n  return x;\n});\n")             # 38-40
+        analyzer = self.analyze(src)
+        got = [(f.name, js_line_col(analyzer.starts, f.node.start)[0], analyzer.end_line(f.node)) for f in analyzer.functions]
+        self.assertEqual(got, [
+            ("decl", 1, 3), ("fetchIt", 4, 6), ("gen", 7, 9), ("arrow", 10, 12), ("default", 13, 15),
+            ("K.method", 17, 19), ("K.load", 20, 22), ("get K.value", 23, 25), ("set K.value", 26, 28),
+            ("K.constructor", 29, 31), ("handler", 34, 36), ("<anonymous>", 38, 40)])
+        self.assertEqual([f.parent for f in analyzer.functions], [None] * 12)
+        nested = self.analyze("function outer() {\n  const inner = () => { if (x) {} };\n  return inner;\n}\n")
+        self.assertEqual([(f.name, f.parent.name if f.parent else None) for f in nested.functions], [("outer", None), ("inner", "outer")])
+        self.assertEqual([c.name for c in nested.functions[0].children], ["inner"])
+        more = self.analyze("module.exports = function () {};\nobj.handler = async () => {};\nclass A { static { init(); } }\n"
+                            "const B = class { run() {} };\nexport default class { go() {} }\n")
+        self.assertEqual([f.name for f in more.functions], ["exports", "handler", "A.<static>", "B.run", "default.go"])
+
+    def metrics(self, src: str, rel: str = "a.ts") -> Dict[str, Tuple[int, int]]:
+        analyzer = self.analyze(src, rel)
+        return {f.name: (analyzer.complexity(f), analyzer.max_nesting(f.node, True)[0]) for f in analyzer.functions}
+
+    def test_complexity_and_nesting_on_the_ast(self):
+        # the v1.2 hand-computed samples, now exact on the AST
+        a = "function a(x) { if (x) {} if (x > 1) {} if (x > 2) {} return x; }\n"
+        self.assertEqual(self.metrics(a)["a"][0], 4)                       # 1 + 3 if
+        b = ("function b(x, y, z, k) {\n"
+             "  if (x) { } else if (y) { } else { }\n"
+             "  for (const i of z) { }\n"
+             "  const v = x && y || z ?? k;\n"
+             "  const w = x ? 1 : 2;\n"
+             "  switch (k) { case 1: break; case 2: break; case 3: break; default: break; }\n"
+             "  try { run(); } catch (e) { log(e); }\n"
+             "  return v + w;\n}\n")
+        self.assertEqual(self.metrics(b)["b"][0], 12)                      # 1 + 2 + 1 + 3 + 1 + 3 + 1
+        self.assertEqual(self.metrics("function c(a) { return a?.b ?? c; }\n")["c"][0], 2)
+        d = ("function d(a) {\n  const inner = (q) => { if (q) { return 1; } return 2; };\n"
+             "  if (a) { return inner(a); }\n  return 0;\n}\n")
+        self.assertEqual((self.metrics(d)["d"][0], self.metrics(d)["inner"][0]), (2, 2))
+        e = "function e(a?: number, b?: string) { const o: { p?: number } = {}; return a ? o : b; }\n"
+        self.assertEqual(self.metrics(e)["e"][0], 2)
+        # cases the old heuristic could get wrong: all still 1 + 1 (one real `if`)
+        tricky = ("function t(a: unknown, b: string) {\n"
+                  "  const s = 'if (x) { for (y) {} } && z';\n"            # text in a string
+                  "  const r = /a && b \\|\\| c \\? d : e/;\n"              # operators in a regex
+                  "  // for (;;) { if (q) {} } while (z) {} case 1:\n"      # comment
+                  "  /* catch (e) {} ?? && */\n"
+                  "  type R = typeof a extends string ? 'y' : 'n';\n"     # type-level conditional
+                  "  const o: { k?: number } = {};\n"
+                  "  if (b) { return r.test(s) ? o : null; }\n"             # if + ternary
+                  "  return o;\n}\n")
+        self.assertEqual(self.metrics(tricky)["t"], (3, 1))               # 1 + if + ternary; nesting 1
+        logical = "function l(a, b) { a ||= b; a &&= b; a ??= b; return a; }\n"
+        self.assertEqual(self.metrics(logical)["l"][0], 4)
+        deep = ("function f(a) {\n  if (a) {\n    for (;;) {\n      while (a) {\n        try {\n"
+                "          if (a) { run(); }\n        } catch (e) { log(e); }\n      }\n    }\n  }\n}\n")
+        analyzer = self.analyze(deep)
+        depth, pos = analyzer.max_nesting(analyzer.functions[0].node, True)
+        self.assertEqual((depth, js_line_col(analyzer.starts, pos)[0]), (5, 6))
+        chain = "function g(a) {\n  if (a === 0) { run(); }\n" + "".join("  else if (a === %d) { run(); }\n" % i for i in range(1, 7)) + "  else { run(); }\n}\n"
+        self.assertEqual(self.metrics(chain)["g"], (8, 1))                 # 1 + 7 if; else-if adds no depth
+        findings = self.scan_files({"a.ts": deep})
+        hits = self.by_rule(findings, "RS-QUAL-002")
+        self.assertEqual([(f.line, f.confidence) for f in hits], [(6, "high")])
+        self.assertNotIn("approximate", hits[0].message)
+
+    def test_import_graph_forms(self):
+        files = {"a.ts": "export * from './b';\n", "b.ts": "export { c } from './c';\n",
+                 "c.ts": "import d = require('./d');\nexport const c = d;\n", "d.ts": "import { a } from './a';\nexport default 1;\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].severity, "high")
+        self.assertIn("a -> b -> c -> d -> a", cycles[0].message)
+        soft = {"a.ts": "import type { B } from './b';\nexport type { B2 } from './b';\nexport class A {}\n",
+                "b.ts": "export function f() { const a = require('./a'); return a; }\nexport type B2 = number;\n"}
+        cycles = self.by_rule(self.scan_files(soft), "RS-ARCH-001")
+        self.assertEqual([c.severity for c in cycles], ["low"])
+        imports = self.analyze("import { x } from './x';\nimport type { T } from './t';\nimport { type U, v } from './u';\n"
+                               "function f() { return import('./dyn'); }\nconst r = require('./r');\nexport * from './all';\n"
+                               "// import './comment';\nconst s = \"import './string'\";\n", "a.ts").collect_imports()
+        self.assertEqual([(i.specifier, i.soft) for i in imports],
+                         [("./x", False), ("./t", True), ("./u", False), ("./dyn", True), ("./r", False), ("./all", False)])
+        self.assertEqual([(i.lineno, i.col) for i in imports][:2], [(1, 19), (2, 24)])
+
+    def test_sinks_true_positives_negatives_and_old_regex_mistakes(self):
+        src = ("const { exec } = require('child_process');\n"                      # 1
+               "app.get('/run', (req, res) => {\n"                                  # 2
+               "  exec(req.query.cmd);\n"                                           # 3 critical (tainted)
+               "  const c = req.body.c;\n"                                          # 4
+               "  exec(c);\n"                                                       # 5 critical (taint-lite)
+               "  const { cmd } = req.query;\n"                                     # 6
+               "  exec(`ls ${cmd}`);\n"                                             # 7 critical
+               "  exec(userInput);\n"                                               # 8 high (untainted)
+               "  exec('ls');\n"                                                    # 9 medium
+               "  exec(CMD);\n"                                                     # 10 medium (const)
+               "  exec(process.argv[2]);\n"                                         # 11 critical
+               "});\n"
+               "const CMD = 'ls -la';\n"                                            # 13
+               "const api = { exec(cmd) { return run(cmd); }, eval(x) { return x; } };\n"  # 14 not a call
+               "re.exec(str);\n"                                                    # 15 RegExp.exec: not flagged
+               "window.eval(code);\n"                                               # 16 high
+               "obj.eval(x);\n"                                                     # 17 not flagged
+               "eval('1 + 1');\n"                                                   # 18 medium
+               "let innerHTML = userHtml;\n"                                        # 19 not an assignment to the DOM
+               "const h = { innerHTML: userHtml };\n"                               # 20 not flagged
+               "if (el.innerHTML === x) {}\n"                                       # 21 not flagged
+               "el.innerHTML = userHtml;\n"                                         # 22 medium
+               "el.innerHTML = '<b>ok</b>';\n"                                      # 23 low
+               "el['outerHTML'] = req.body.html;\n"                                 # 24 high
+               "document.write(req.query.x);\n"                                     # 25 high
+               "el.insertAdjacentHTML('beforeend', frag);\n"                        # 26 medium
+               "setTimeout('tick()', 10);\n"                                        # 27 medium
+               "setTimeout(() => tick(), 10);\n"                                    # 28 not flagged
+               "setTimeout(req.body.code, 10);\n"                                   # 29 critical
+               "const F = new Function('a', 'return a');\n"                         # 30 medium
+               "const G = Function(req.query.src);\n")                              # 31 critical
+        findings = self.scan_files({"a.js": src})
+        got = {f.line: f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertEqual(got, {3: "critical", 5: "critical", 7: "critical", 8: "high", 9: "medium", 10: "medium",
+                               11: "critical", 16: "high", 18: "medium", 22: "medium", 23: "low", 24: "high",
+                               25: "high", 26: "medium", 27: "medium", 29: "critical", 30: "medium", 31: "critical"})
+        self.assertTrue(all(f.confidence == "high" and "approximate" not in f.message
+                            for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")))
+        # the old regex path reports the method definitions on line 14 and misses window.eval
+        with self.heuristics_only():
+            old = {f.line for f in self.scan_files({"a.js": src}) if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertIn(14, old)
+        self.assertNotIn(16, old)
+        spawn = ("import { spawn, execFile } from 'node:child_process';\nspawn('ls', [], { shell: true });\n"
+                 "spawn(req.query.c, { shell: true });\nspawn('ls', []);\nexecFile(cmd, args, { shell: false });\n")
+        got = {f.line: f.severity for f in self.by_rule(self.scan_files({"s.mjs": spawn}), "RS-SEC-003")}
+        self.assertEqual(got, {2: "medium", 3: "critical"})
+        shadow = "const exec = (x) => x;\nexec(cmd);\nconst cp = require('child_process');\ncp.exec(cmd);\nrequire('child_process').execSync(c);\n"
+        self.assertEqual(sorted(f.line for f in self.by_rule(self.scan_files({"b.js": shadow}), "RS-SEC-003")), [4, 5])
+
+    def test_insecure_configuration_on_the_ast(self):
+        src = ("import https from 'node:https';\nimport { createHash } from 'crypto';\nimport * as fs from 'fs';\n"
+               "const agent = new https.Agent({ rejectUnauthorized: false });\n"                     # 4 high
+               "const txt = 'rejectUnauthorized: false';\n"                                           # 5 string: no
+               "const opts = { rejectUnauthorized: flag };\n"                                         # 6 no
+               "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';\n"                                    # 7 high
+               "process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = 0;\n"                                   # 8 high
+               "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';\n"                                    # 9 no
+               "const ALGO = 'md5';\n"                                                                # 10
+               "createHash(ALGO).update(pw);\n"                                                       # 11 medium (const)
+               "createHash('sha1');\n"                                                                # 12 medium
+               "createHash('sha256');\n"                                                              # 13 no
+               "const sessionToken = Math.random().toString(36);\n"                                   # 14 medium
+               "const n1 = 1;\nconst n2 = 2;\nconst n3 = 3;\n"                                      # 15-17 (out of the window)
+               "const jitter = Math.random();\n"                                                      # 18 no
+               "jwt.verify(t, k, { algorithms: ['HS256', 'none'] });\n"                               # 19 high
+               "jwt.verify(t, k, { algorithms: ['HS256'] });\n"                                       # 20 no
+               "jwt.sign(p, k, { algorithm: 'none' });\n"                                             # 21 high
+               "app.use(cors({ origin: '*', credentials: true }));\n"                                 # 22 medium
+               "app.use(cors({ origin: '*' }));\n"                                                    # 23 no
+               "app.use(cors({ credentials: true, origin: 'https://a.example' }));\n"                 # 24 no
+               "function h(req, res) {\n"                                                             # 25
+               "  const name = req.params.name;\n"                                                    # 26
+               "  fs.readFile(`${base}/${name}`, cb);\n"                                              # 27 medium (taint-lite)
+               "  fs.readFile('/etc/hosts', cb);\n"                                                   # 28 no
+               "  fs.promises.unlink(path.join(base, req.query.id));\n"                               # 29 medium
+               "  const re = new RegExp(req.query.q);\n"                                              # 30 low
+               "  const ok = new RegExp('^a+$');\n"                                                   # 31 no
+               "  return React.createElement('div', { dangerouslySetInnerHTML: { __html: req.body.html } });\n"  # 32 high
+               "}\n")
+        findings = self.scan_files({"server.mjs": src})
+        got = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(got, {4: "high", 7: "high", 8: "high", 11: "medium", 12: "medium", 14: "medium", 19: "high",
+                               21: "high", 22: "medium", 27: "medium", 29: "medium", 30: "low", 32: "high"})
+        self.assertEqual({f.line: f.confidence for f in self.by_rule(findings, "RS-SEC-006") if f.line in (14, 27, 30)},
+                         {14: "medium", 27: "high", 30: "high"})
+        jsx = ("export function View({ html, req }) {\n  return (\n    <div>\n      <p dangerouslySetInnerHTML={{ __html: html }} />\n"
+               "      <p dangerouslySetInnerHTML={{ __html: req.body.html }} />\n      <p dangerouslySetInnerHTML={{ __html: '<b>x</b>' }} />\n"
+               "    </div>\n  );\n}\n")
+        got = {f.line: f.severity for f in self.by_rule(self.scan_files({"v.tsx": jsx}), "RS-SEC-006")}
+        self.assertEqual(got, {4: "medium", 5: "high", 6: "low"})
+
+    def test_async_and_resource_rules_on_the_ast(self):
+        src = ("const fs = require('fs');\nconst net = require('net');\n"
+               "async function save(x) { await fs.promises.writeFile('a', x); }\n"                   # 3
+               "class Svc {\n  async run() { this.save(); await this.save(); }\n  async save() {} }\n"  # 5 floating this.save()
+               "function usesAwait() {\n  const d = fs.readFileSync('a');\n  return (async () => { await d; })();\n}\n"  # 7-10: no await directly
+               "async function main(items) {\n"                                                       # 11
+               "  save(1);\n"                                                                           # 12 floating
+               "  await save(2);\n  void save(3);\n  save(4).catch(log);\n  return save(5);\n"         # 13-16 ok
+               "}\n"
+               "function sync(items) {\n"                                                               # 18
+               "  const data = fs.readFileSync('x');\n"                                                 # 19 ok: not async
+               "  items.forEach(async (i) => { await save(i); });\n"                                    # 20 forEach(async)
+               "  fetch('/a');\n"                                                                        # 21 floating
+               "  fetch('/b').then((r) => r.json());\n"                                                 # 22 then w/o catch
+               "  fetch('/c').then(ok, onError);\n  fetch('/d').then(ok).catch(log);\n  log(fetch('/e'));\n"  # 23-25 ok
+               "  Promise.all([save(1)]);\n"                                                             # 26 floating
+               "  const p = fetch('/f');\n  p.then(use);\n"                                              # 27 ok, 28 then w/o catch
+               "  somethingElse().finally(done);\n"                                                      # 29 not flagged
+               "}\n"
+               "async function withAwait() {\n  await x;\n  const n = fs.readFileSync('n');\n"            # 31-33 blocking
+               "  const cb = () => fs.readFileSync('m');\n  return cb;\n}\n"                             # 34 nested sync: ok
+               "const w = fs.createWriteStream('out');\n"                                                # 37 leak
+               "const piped = fs.createWriteStream('p'); src.pipe(piped);\n"                             # 38 ok
+               "const rs = fs.createReadStream('r');\n"                                                  # 39 leak (never consumed)
+               "const rs2 = fs.createReadStream('r2'); rs2.on('data', use);\n"                           # 40 ok
+               "function openIt() { const fh = fs.openSync('f'); return fh; }\n"                         # 41 ok (returned)
+               "function closeIt() { const fh = fs.openSync('f'); try { use(fh); } finally { fs.closeSync(fh); } }\n"  # 42 ok
+               "const sock = net.createConnection(80);\n"                                                # 43 leak
+               "const ws = new WebSocket(u); ws.close();\n"                                              # 44 ok
+               "const timer = setInterval(tick, 10);\n"                                                  # 45 leak
+               "const t2 = setInterval(tick, 10); clearInterval(t2);\n"                                  # 46 ok
+               "setInterval(tick, 50);\n"                                                                # 47 discarded
+               "class Poller { start() { this.timer = setInterval(tick, 1); } }\n")                      # 48 ok (field)
+        findings = self.scan_files({"a.js": src})
+        got = sorted((f.rule_id, f.line) for f in findings if f.rule_id in ("RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001"))
+        self.assertEqual(got, [("RS-ASYNC-001", 33),
+                               ("RS-ASYNC-002", 5), ("RS-ASYNC-002", 12), ("RS-ASYNC-002", 20), ("RS-ASYNC-002", 21),
+                               ("RS-ASYNC-002", 22), ("RS-ASYNC-002", 26), ("RS-ASYNC-002", 28),
+                               ("RS-RES-001", 37), ("RS-RES-001", 39), ("RS-RES-001", 43), ("RS-RES-001", 45), ("RS-RES-001", 47)])
+        self.assertTrue(all(f.confidence == "high" and "approximate" not in f.message
+                            for f in findings if f.rule_id in ("RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001")))
+        self.assertEqual([f for f in self.scan_files({"a.test.js": src}) if f.rule_id.startswith(("RS-ASYNC", "RS-RES"))], [])
+
+    PARITY = {
+        "app.js": ("const { exec } = require('child_process');\nconst util = require('./util');\n"
+                   "app.get('/x', (req, res) => {\n  exec(req.query.cmd);\n  const c = req.body.c;\n  exec(c);\n});\n"
+                   "const api = { exec(cmd) { return util.run(cmd); } };\n"           # old FP: method named exec
+                   "window.eval(code);\n"                                            # old FN: eval as a global member
+                   "try { api.exec('ls'); } catch (e) {}\n"
+                   "module.exports = api;\n"),
+        "util.js": ("const app = require('./app');\n"
+                    "function run(cmd, x: T) {\n"
+                    "  const t = (x as any) as (T extends U ? A : B);\n"          # old FP: type-level `?` counted
+                    "  if (cmd === 1) {} if (cmd === 2) {} if (cmd === 3) {} if (cmd === 4) {} if (cmd === 5) {}\n"
+                    "  if (cmd === 6) {} if (cmd === 7) {} if (cmd === 8) {} if (cmd === 9) {}\n"
+                    "  return t;\n}\nmodule.exports = { run, app };\n"),
+    }
+
+    def test_fallback_parity_with_parser_disabled(self):
+        files = {"app.js": self.PARITY["app.js"], "util.ts": self.PARITY["util.js"]}
+        new = {(f.rule_id, f.file, f.line) for f in self.scan_files(files)}
+        with self.heuristics_only():
+            old_findings = self.scan_files(files)
+        old = {(f.rule_id, f.file, f.line) for f in old_findings}
+        true_positives = {("RS-SEC-003", "app.js", 4), ("RS-SEC-003", "app.js", 6), ("RS-QUAL-004", "app.js", 10),
+                          ("RS-ARCH-001", "app.js", 2)}
+        old_false_positives = {("RS-SEC-003", "app.js", 8), ("RS-QUAL-001", "util.ts", 2)}
+        self.assertEqual(old, true_positives | old_false_positives)
+        self.assertEqual(new, true_positives | {("RS-SEC-004", "app.js", 9)})
+        self.assertTrue(all(f.confidence in ("low", "medium") or f.rule_id == "RS-ARCH-001" for f in old_findings))
+        self.assertTrue(all("approximate" in f.message for f in old_findings if f.rule_id.startswith("RS-QUAL")))
+        self.assertEqual(self.by_rule(old_findings, "RS-SYS-001"), [])
+
+    TS_PROJECT = {
+        "src/index.ts": ("export * from './routes/users';\nexport { App } from './app';\nexport type { User } from './models/user';\n"
+                         "export { Role, Color } from './models/role';\nexport * as utils from './lib/utils';\n"),
+        "src/app.ts": (
+            "import express, { Request, Response, NextFunction } from 'express';\nimport { exec } from 'node:child_process';\n"
+            "import { usersRouter } from './routes/users';\nimport { Repository } from './lib/repository';\nimport type { User } from './models/user';\n\n"
+            "export class App {\n  private readonly app = express();\n  private repo: Repository<User>;\n\n"
+            "  constructor(private readonly port: number = 3000) {\n    this.repo = new Repository<User>('users');\n    this.app.use(express.json());\n"
+            "    this.app.use('/users', usersRouter);\n    this.app.get('/health', (_req: Request, res: Response) => res.json({ ok: true }));\n"
+            "    this.app.get('/run', (req: Request, res: Response, next: NextFunction) => {\n      const cmd = req.query.cmd as string;\n"
+            "      exec(cmd, (err, out) => (err ? next(err) : res.send(out)));\n    });\n  }\n\n"
+            "  async start(): Promise<void> {\n    await this.repo.connect();\n    this.app.listen(this.port, () => console.log(`listening on ${this.port}`));\n  }\n}\n"),
+        "src/routes/users.ts": (
+            "import { Router, Request, Response } from 'express';\nimport { User, isAdmin } from '../models/user';\nimport { Role } from '../models/role';\n"
+            "import { paginate, Page } from '../lib/utils';\n\nexport const usersRouter = Router();\nconst users: User[] = [];\n\n"
+            "usersRouter.get('/', (req: Request, res: Response) => {\n  const page: Page<User> = paginate(users, Number(req.query.page ?? 1), 20);\n  res.json(page);\n});\n\n"
+            "usersRouter.post('/', (req: Request<{}, {}, Partial<User>>, res: Response) => {\n  const body = req.body;\n"
+            "  if (!body.name || typeof body.name !== 'string') {\n    return res.status(400).json({ error: 'name required' });\n  }\n"
+            "  const user: User = { id: users.length + 1, name: body.name, role: body.role ?? Role.Viewer, tags: body.tags ?? [] };\n"
+            "  users.push(user);\n  res.status(201).json(user);\n});\n\n"
+            "usersRouter.delete('/:id', (req: Request<{ id: string }>, res: Response) => {\n  const idx = users.findIndex((u) => u.id === Number(req.params.id));\n"
+            "  if (idx < 0) {\n    return res.sendStatus(404);\n  }\n  if (!isAdmin(users[idx]!)) {\n    users.splice(idx, 1);\n  }\n  try {\n    audit(users[idx]);\n  } catch {\n  }\n  res.sendStatus(204);\n});\n\n"
+            "function audit(user?: User): void {\n  if (user) {\n    console.log(`deleted ${user.name}`);\n  }\n}\n"),
+        "src/models/user.ts": (
+            "import { Role } from './role';\n\nexport interface User {\n  readonly id: number;\n  name: string;\n  role: Role;\n  tags: string[];\n  email?: string;\n}\n\n"
+            "export type UserPatch = Partial<Omit<User, 'id'>>;\nexport type Keys = keyof User;\nexport type Getters<T> = { [K in keyof T as `get${Capitalize<K & string>}`]: () => T[K] };\n\n"
+            "export function isAdmin(user: User): user is User & { role: Role.Admin } {\n  return user.role === Role.Admin;\n}\n\n"
+            "export const DEFAULT_USER = { id: 0, name: 'anonymous', role: Role.Viewer, tags: [] } as const satisfies Readonly<User>;\n"),
+        "src/models/role.ts": (
+            "export enum Role {\n  Admin = 'admin',\n  Editor = 'editor',\n  Viewer = 'viewer',\n}\n\nexport const enum Color { Red, Green = 2, Blue = Green << 1 }\n\n"
+            "export namespace Role {\n  export function parse(value: string): Role {\n    switch (value) {\n      case 'admin': return Role.Admin;\n      case 'editor': return Role.Editor;\n      default: return Role.Viewer;\n    }\n  }\n}\n"),
+        "src/lib/utils.ts": (
+            "import { Repository } from './repository';\n\nexport interface Page<T> {\n  items: T[];\n  page: number;\n  total: number;\n}\n\n"
+            "export function makeRepo<T extends { id: number }>(name: string): Repository<T> {\n  return Repository.create<T>(name);\n}\n\n"
+            "export function paginate<T>(items: readonly T[], page: number, size: number): Page<T> {\n  const start = (page - 1) * size;\n"
+            "  return { items: items.slice(start, start + size), page, total: items.length };\n}\n\n"
+            "export const identity = <T,>(x: T): T => x;\nexport const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));\n"
+            "export function assertNever(x: never): never {\n  throw new Error(`unexpected ${JSON.stringify(x)}`);\n}\n\n"
+            "export abstract class Base<T extends { id: number }> {\n  protected items = new Map<number, T>();\n  abstract validate(item: T): boolean;\n"
+            "  add(item: T): this {\n    if (this.validate(item)) {\n      this.items.set(item.id, item);\n    }\n    return this;\n  }\n}\n"),
+        "src/lib/repository.ts": (
+            "import { Base } from './utils';\n\nfunction log(target: object, key: string, descriptor: PropertyDescriptor): PropertyDescriptor {\n  return descriptor;\n}\n\n"
+            "export class Repository<T extends { id: number }> extends Base<T> {\n  private connected = false;\n  declare readonly kind: 'memory';\n\n"
+            "  constructor(public readonly name: string) {\n    super();\n  }\n\n"
+            "  validate(item: T): boolean {\n    return item.id > 0;\n  }\n\n"
+            "  @log\n  async connect(): Promise<void> {\n    this.connected = true;\n    await Promise.resolve();\n  }\n\n"
+            "  get size(): number {\n    return this.items.size;\n  }\n\n"
+            "  find(id: number): T | undefined {\n    return this.items.get(id);\n  }\n\n"
+            "  static create<U extends { id: number }>(name: string): Repository<U> {\n    return new Repository<U>(name);\n  }\n}\n"),
+        "src/ui/UserList.tsx": (
+            "import React, { useEffect, useState } from 'react';\nimport type { User } from '../models/user';\nimport { Role } from '../models/role';\n\n"
+            "interface Props {\n  users: User[];\n  onSelect?: (user: User) => void;\n  highlight?: Role;\n}\n\n"
+            "export function UserList({ users, onSelect, highlight = Role.Admin }: Props) {\n  const [filter, setFilter] = useState<string>('');\n"
+            "  const [count, setCount] = useState(0);\n\n  useEffect(() => {\n    setCount(users.length);\n  }, [users]);\n\n"
+            "  const visible = users.filter((u) => u.name.toLowerCase().includes(filter.toLowerCase()));\n\n"
+            "  return (\n    <section className=\"user-list\">\n      <h2>Users ({count})</h2>\n"
+            "      <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder=\"Filter users…\" />\n"
+            "      {visible.length === 0 ? (\n        <p>No one's here yet.</p>\n      ) : (\n        <ul>\n"
+            "          {visible.map((u) => (\n            <li key={u.id} className={u.role === highlight ? 'hl' : ''} onClick={() => onSelect?.(u)}>\n"
+            "              {u.name} <small>{u.role}</small> {u.tags.length > 0 && <em>{u.tags.join(', ')}</em>}\n            </li>\n          ))}\n        </ul>\n      )}\n"
+            "      <footer>{\"{\"}{count}{\"}\"} total &amp; {visible.length} shown</footer>\n    </section>\n  );\n}\n\n"
+            "export const Badge = <T extends { label: string },>({ item }: { item: T }) => <span className=\"badge\">{item.label}</span>;\n\nexport default UserList;\n"),
+        "src/lib/events.ts": (
+            "import type { User } from '@/models/user';\n\ntype Listener<T> = (payload: T) => void | Promise<void>;\n\n"
+            "export interface EventMap {\n  'user:created': User;\n  'user:deleted': { id: number };\n  tick: void;\n}\n\n"
+            "export class Emitter<M extends Record<string, unknown> = EventMap> {\n  readonly #listeners = new Map<keyof M, Set<Listener<any>>>();\n\n"
+            "  on<K extends keyof M>(event: K, listener: Listener<M[K]>): () => void;\n  on<K extends keyof M>(event: K, listener: Listener<M[K]>, once: boolean): () => void;\n"
+            "  on<K extends keyof M>(event: K, listener: Listener<M[K]>, once = false): () => void {\n    const wrapped: Listener<M[K]> = once\n"
+            "      ? (payload) => {\n          this.off(event, wrapped);\n          return listener(payload);\n        }\n      : listener;\n"
+            "    let set = this.#listeners.get(event);\n    if (!set) {\n      set = new Set();\n      this.#listeners.set(event, set);\n    }\n    set.add(wrapped);\n"
+            "    return () => this.off(event, wrapped);\n  }\n\n"
+            "  off<K extends keyof M>(event: K, listener: Listener<M[K]>): void {\n    this.#listeners.get(event)?.delete(listener);\n  }\n\n"
+            "  async emit<K extends keyof M>(event: K, payload: M[K]): Promise<number> {\n    const set = this.#listeners.get(event);\n    if (!set) {\n      return 0;\n    }\n"
+            "    await Promise.all([...set].map((l) => l(payload)));\n    return set.size;\n  }\n}\n\n"
+            "export namespace Events {\n  export const global = new Emitter();\n  export declare const version: string;\n}\n"),
+        "src/ui/hooks.tsx": (
+            "import { useCallback, useMemo, useRef, useState } from 'react';\nimport { Events } from '@/lib/events';\n\n"
+            "export function useToggle(initial = false): [boolean, () => void] {\n  const [on, setOn] = useState(initial);\n"
+            "  const toggle = useCallback(() => setOn((v) => !v), []);\n  return [on, toggle];\n}\n\n"
+            "export function useLatest<T>(value: T) {\n  const ref = useRef<T>(value);\n  ref.current = value;\n  return ref;\n}\n\n"
+            "export function Spinner({ size = 16, label }: { size?: number; label?: string }) {\n"
+            "  const style = useMemo(() => ({ width: size, height: size }), [size]);\n"
+            "  return (\n    <span role=\"status\" style={style} aria-label={label ?? 'loading'}>\n      {label && <span className=\"sr-only\">{label}</span>}\n    </span>\n  );\n}\n\n"
+            "export const subscribe = Events.global.on.bind(Events.global);\n"),
+        "tsconfig.json": "{\n  \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@/*\": [\"src/*\"] }, \"jsx\": \"react\" }\n}\n",
+    }
+
+    def test_dogfood_typescript_project(self):
+        lines = sum(v.count("\n") for k, v in self.TS_PROJECT.items() if k != "tsconfig.json")
+        self.assertGreaterEqual(lines, 250)
+        for rel, src in self.TS_PROJECT.items():
+            if rel.endswith(".json"):
+                continue
+            result = js_parse(src, rel)
+            self.assertTrue(result.ok, rel)
+            self.assertEqual(result.errors, [], rel)
+        findings = self.scan_files(self.TS_PROJECT)
+        self.assertEqual(sorted({(f.rule_id, f.file) for f in findings}),
+                         [("RS-ARCH-001", "src/lib/repository.ts"), ("RS-QUAL-004", "src/routes/users.ts"), ("RS-SEC-003", "src/app.ts")])
+        self.assertEqual(len(findings), 3)
+        sec = self.by_rule(findings, "RS-SEC-003")[0]
+        self.assertEqual((sec.line, sec.severity, sec.confidence), (18, "critical", "high"))
+        self.assertEqual(self.by_rule(findings, "RS-SYS-001"), [])
+        cycle = self.by_rule(findings, "RS-ARCH-001")[0]
+        self.assertIn("src/lib/repository -> src/lib/utils -> src/lib/repository", cycle.message)
+        self.assertEqual(cycle.severity, "high")
+
+    def test_json_output_deterministic_and_crlf_identical(self):
+        root_lf = self.make_project(self.TS_PROJECT)
+        root_crlf = self.make_project({k: v.replace("\n", "\r\n") for k, v in self.TS_PROJECT.items()})
+        out1 = self.run_cli([root_lf, "--format", "json"])[1]
+        out2 = self.run_cli([root_lf, "--format", "json"])[1]
+        out3 = self.run_cli([root_crlf, "--format", "json"])[1]
+        self.assertEqual(out1, out2)
+        self.assertEqual(out1, out3)
+        data = json.loads(out1)
+        self.assertEqual(data["version"], __version__)
+        self.assertEqual(data["summary"]["total"], 3)
+
+    def test_env_var_forces_heuristics_and_suppression_baseline_still_work(self):
+        src = "const { exec } = require('child_process');\nexec(req.query.cmd);\nexec(x); // reposentry: ignore RS-SEC-003\n"
+        root = self.make_project({"a.js": src})
+        new = scan(root).findings
+        self.assertEqual([(f.line, f.confidence) for f in self.by_rule(new, "RS-SEC-003")], [(2, "high")])
+        with self.heuristics_only():
+            old = scan(root).findings
+        self.assertEqual([(f.line, f.confidence) for f in self.by_rule(old, "RS-SEC-003")], [(2, "medium")])
+        self.assertEqual(self.by_rule(old, "RS-SYS-001"), [])
+        self.assertEqual(new[0].fingerprint(), old[0].fingerprint())  # same rule/file/snippet: baselines stay valid
+        baseline = os.path.join(root, "b.json")
+        self.assertEqual(self.run_cli([root, "--write-baseline", baseline])[0], 1)
+        self.assertEqual(self.run_cli([root, "--baseline", baseline])[0], 0)
+        self.assertEqual(self.by_rule(self.scan_files({"a.js": src}, {"severity_overrides": {"RS-SEC-003": "low"}}), "RS-SEC-003")[0].severity, "low")
 
 
 if __name__ == "__main__":
