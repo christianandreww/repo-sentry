@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -88,7 +88,7 @@ for _r in (
          "Use the async equivalent (asyncio.sleep, aiohttp/httpx.AsyncClient, "
          "asyncio.create_subprocess_exec, aiofiles) or offload with "
          "`await asyncio.to_thread(...)` / `loop.run_in_executor(...)`.",
-         "python"),
+         "python, js (approximate)"),
     Rule("RS-ASYNC-002", "Fire-and-forget task", "medium", "async",
          "asyncio.create_task / ensure_future / loop.create_task whose result is "
          "discarded or stored in a variable that is never awaited, gathered, returned "
@@ -96,7 +96,7 @@ for _r in (
          "their exceptions are silently lost.",
          "Keep a strong reference and await/gather the task, use asyncio.TaskGroup, or "
          "attach add_done_callback to surface exceptions.",
-         "python"),
+         "python, js (approximate)"),
     Rule("RS-ASYNC-003", "Unprotected shared mutable state", "medium", "async",
          "A module-level list/dict/set is mutated inside an async def with no "
          "asyncio.Lock/threading.Lock held in scope. Concurrent coroutines can "
@@ -110,7 +110,7 @@ for _r in (
          "contextlib.closing, ExitStack.enter_context or a try/finally close(). Returned, "
          "yielded or stored resources are exempt.",
          "Wrap the resource in a `with` block or close it in a `finally` clause.",
-         "python"),
+         "python, js (approximate)"),
     Rule("RS-QUAL-001", "Cyclomatic complexity too high", "medium", "quality",
          "McCabe complexity above `max_cyclomatic_complexity` (default 10); high when "
          "above twice the threshold. Nested functions are scored separately.",
@@ -1559,6 +1559,75 @@ def _js_arrow_name(text: str, params_start: int) -> str:
             return m.group(1).split(".")[-1]
     return "<anonymous>"
 
+_JS_SYNC_BLOCKING_RE = re.compile(
+    r"(?<![\w$])(?:([A-Za-z_$][\w$]*)\s*\.\s*)?(readFileSync|writeFileSync|appendFileSync|readdirSync|statSync|lstatSync|"
+    r"existsSync|mkdirSync|rmSync|rmdirSync|unlinkSync|copyFileSync|renameSync|execSync|execFileSync|spawnSync|"
+    r"pbkdf2Sync|scryptSync|gzipSync|gunzipSync|deflateSync|inflateSync|brotliCompressSync)\s*\(")
+_JS_ATOMICS_WAIT_RE = re.compile(r"(?<![\w$])Atomics\s*\.\s*wait\s*\(")
+_JS_ASYNC_WORD_RE = re.compile(r"(?<![\w$])async\b")
+_JS_STMT_START_RE = re.compile(r"(?:(?:this|self)\s*\.\s*)?([A-Za-z_$#][\w$]*)\s*\(")
+_JS_STMT_PROMISE_API_RE = re.compile(
+    r"((?:fetch|Promise\s*\.\s*(?:all|allSettled|race|any))|[A-Za-z_$][\w$]*\s*\.\s*promises\s*\.\s*[A-Za-z_$][\w$]*)\s*\(")
+_JS_FOREACH_ASYNC_RE = re.compile(r"\.\s*forEach\s*\(\s*async\b")
+_JS_RESOURCE_ASSIGN_RE = re.compile(
+    r"(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?"
+    r"(?:(?:fs|fsp|fsPromises|net|tls|http2)\s*\.\s*(?:promises\s*\.\s*)?(createWriteStream|openSync|open|createConnection|connect)\s*\("
+    r"|new\s+(?:net\s*\.\s*)?(WebSocket|Socket)\s*\()")
+_JS_JS_KEYWORDS_NOT_FUNCS = frozenset(("if", "for", "while", "switch", "catch", "function", "return", "await", "typeof", "new", "super"))
+
+
+def _js_at_statement_start(masked: str, i: int) -> bool:
+    """True when the previous significant character before offset i ends a statement or opens a block (or there is
+    none), i.e. an expression starting at i is a statement, not an operand, argument or arrow-function body."""
+    k = i - 1
+    while k >= 0 and masked[k] in " \t\r\n":
+        k -= 1
+    return k < 0 or masked[k] in ";{}"
+
+
+def _js_top_level_args(masked: str, paren: int) -> int:
+    """Number of top-level arguments of the call whose `(` is at `paren` (0 for an empty argument list)."""
+    close = _js_match_forward(masked, paren, "(", ")")
+    inner = masked[paren + 1:close]
+    if not inner.strip():
+        return 0
+    depth = 0
+    count = 1
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            count += 1
+    return count
+
+
+def _js_statement_end(masked: str, i: int) -> int:
+    """End offset (exclusive) of the statement beginning at i: the first `;` at bracket depth 0, or a newline at
+    depth 0 whose next significant character does not continue a method chain."""
+    n = len(masked)
+    depth = 0
+    k = i
+    while k < n:
+        ch = masked[k]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return k
+        elif depth == 0 and ch == ";":
+            return k + 1
+        elif depth == 0 and ch == "\n":
+            j = k + 1
+            while j < n and masked[j] in " \t\r\n":
+                j += 1
+            if j >= n or masked[j] != ".":
+                return k
+        k += 1
+    return n
+
 
 @dataclasses.dataclass
 class JsFunction:
@@ -1742,6 +1811,94 @@ class JsAnalyzer:
             for m in _JS_EMPTY_CATCH_RE.finditer(self.masked):
                 self._finding("RS-QUAL-004", RULES["RS-QUAL-004"].severity, "medium", m.start(),
                               "Empty catch block silently swallows errors (approximate JS/TS check)")
+
+    # -- RS-ASYNC-001/002 and RS-RES-001 for JS/TS (approximate) ----------------
+    def _is_async(self, f: "JsFunction") -> bool:
+        masked = self.masked
+        return bool(_JS_ASYNC_WORD_RE.search(masked[f.start:f.body_start])
+                    or masked[max(0, f.start - 8):f.start].rstrip().endswith("async"))
+
+    def run_async_resources(self) -> None:
+        if self.test_file:
+            return
+        masked = self.masked
+        want1, want2, wantr = ("RS-ASYNC-001" in self.enabled, "RS-ASYNC-002" in self.enabled, "RS-RES-001" in self.enabled)
+        async_funcs = [f for f in self.funcs if self._is_async(f)]
+        if want1:
+            for f in async_funcs:
+                own = js_own_text(masked, f.body_start + 1, f.body_end, f.children)
+                base = f.body_start + 1
+                for m in _JS_SYNC_BLOCKING_RE.finditer(own):
+                    label = (m.group(1) + "." if m.group(1) else "") + m.group(2)
+                    self._finding("RS-ASYNC-001", RULES["RS-ASYNC-001"].severity, "medium", base + m.start(),
+                                  "Blocking call %s() inside async function '%s' stalls the event loop (approximate JS/TS check)"
+                                  % (label, f.name),
+                                  "Use the promise-based API (fs.promises.*, util.promisify(child_process.exec), crypto.pbkdf2 "
+                                  "with a callback/promise) or move the work to a worker thread.")
+                for m in _JS_ATOMICS_WAIT_RE.finditer(own):
+                    self._finding("RS-ASYNC-001", RULES["RS-ASYNC-001"].severity, "medium", base + m.start(),
+                                  "Atomics.wait() inside async function '%s' blocks the thread (approximate JS/TS check)" % f.name)
+        if want2:
+            for m in _JS_FOREACH_ASYNC_RE.finditer(masked):
+                self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "medium", m.start(),
+                              "forEach(async ...) does not wait for its callbacks; errors and ordering are lost (approximate JS/TS check)",
+                              "Use `await Promise.all(items.map(async ...))` or a `for...of` loop with await.")
+            names = {f.name for f in async_funcs if f.name not in ("<anonymous>", "default", "constructor")}
+            for m in _JS_STMT_START_RE.finditer(masked):
+                name = m.group(1)
+                if name in _JS_JS_KEYWORDS_NOT_FUNCS or name.lstrip("#") not in {n.lstrip("#") for n in names}:
+                    continue
+                if not _js_at_statement_start(masked, m.start()):
+                    continue
+                self._floating(m.start(1), m.end() - 1, "async function '%s'" % name)
+            for m in _JS_STMT_PROMISE_API_RE.finditer(masked):
+                if not _js_at_statement_start(masked, m.start()):
+                    continue
+                self._floating(m.start(1), m.end() - 1, re.sub(r"\s+", "", m.group(1)) + "()")
+            for m in re.finditer(r"([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*|\s*\([^;{}]*?\))*)\s*\.\s*then\s*\(", masked):
+                if not _js_at_statement_start(masked, m.start(1)):
+                    continue
+                end = _js_statement_end(masked, m.start(1))
+                stmt = masked[m.start(1):end]
+                if re.search(r"\.\s*(catch|finally)\s*\(", stmt) or _js_top_level_args(masked, m.end() - 1) >= 2:
+                    continue  # a rejection handler is attached (`.catch`, `.finally` or then(ok, onError))
+                self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "medium", m.start(1),
+                              "Promise chain with .then() has no .catch(); a rejection becomes an unhandled rejection (approximate JS/TS check)",
+                              "Add `.catch(...)`, or `await` the promise inside try/catch.")
+        if wantr:
+            seen: Set[int] = set()
+            for m in _JS_RESOURCE_ASSIGN_RE.finditer(masked):
+                if m.start() in seen:
+                    continue
+                seen.add(m.start())
+                var = m.group(1)
+                kind = m.group(2) or m.group(3)
+                v = re.escape(var)
+                released = re.search(
+                    r"(?<![\w$.])%s\s*\.\s*(?:close|end|destroy|unref|terminate|removeAllListeners)\s*\(|"
+                    r"(?:closeSync|\.close|fs\.close|pipeline|finished|destroy)\s*\(\s*%s\b|"
+                    r"\.pipe\s*\(\s*%s\b|(?<![\w$.])%s\s*\.\s*pipe\s*\(|return\s+%s\b|(?:this|self|module|exports)\s*\.[\w$.]*\s*=\s*%s\b|"
+                    r"\bexport\b[^;\n]*\b%s\b|\busing\s+%s\b" % (v, v, v, v, v, v, v, v), masked)
+                if released:
+                    continue
+                self._finding("RS-RES-001", RULES["RS-RES-001"].severity, "low", m.start(1),
+                              "Resource from %s() assigned to '%s' is never closed, ended, piped, returned or stored (approximate JS/TS check)"
+                              % (kind, var),
+                              "Close it in a `finally` block (or with `using`), or pass it to stream.pipeline().")
+
+    def _floating(self, call_start: int, paren: int, what: str) -> None:
+        masked = self.masked
+        close = _js_match_forward(masked, paren, "(", ")")
+        end = _js_statement_end(masked, call_start)
+        tail = masked[close + 1:end]
+        if re.match(r"\s*\.\s*(catch|finally)\s*\(", tail) or re.search(r"\.\s*catch\s*\(", tail):
+            return
+        t = re.match(r"\s*\.\s*then\s*\(", tail)
+        if t and _js_top_level_args(masked, close + 1 + t.end() - 1) >= 2:
+            return
+        self._finding("RS-ASYNC-002", RULES["RS-ASYNC-002"].severity, "medium", call_start,
+                      "Promise from %s is neither awaited, returned nor given .catch(); rejections are lost (approximate JS/TS check)" % what,
+                      "`await` it, return it, add `.catch(...)`, or mark intentional fire-and-forget with `void`.")
 
     def collect_imports(self) -> List["JsImport"]:
         """Import specifiers found on the masked text (so comments and strings
@@ -3196,6 +3353,8 @@ class Scanner:
                     f.severity = _downgrade(f.severity)
                     self._emit(f)
             scan_pattern_sinks(sf, sink_emit, analyzer.masked)
+        if self.enabled & {"RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001"}:
+            analyzer.run_async_resources()
         if "RS-SEC-006" in self.enabled:
             analyzer.run_security()
         if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
@@ -4725,6 +4884,52 @@ class TestJsSecurity(_ProjectMixin, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("RS-SEC-006", out)
         self.assertIn("JS/TS: pattern-based, approximate", out)
+
+
+class TestJsAsyncAndResources(_ProjectMixin, unittest.TestCase):
+    FIXTURE = 'const fs = require(\'fs\');\nconst net = require(\'net\');\nasync function save(x) { await fs.promises.writeFile(\'a\', x); }\nasync function load() {\n  const d = fs.readFileSync(\'a\');            // L5 blocking\n  const e = await fs.promises.readFile(\'a\'); // ok\n  function inner() { return fs.readFileSync(\'b\'); } // sync nested: ok\n  return d;\n}\nconst arrow = async () => { execSync(\'ls\'); };      // L10 blocking\nfunction sync() { return fs.readFileSync(\'c\'); }    // ok (not async)\nasync function main(items) {\n  save(1);                                  // L13 floating\n  await save(2);                            // ok\n  void save(3);                             // ok\n  save(4).catch(console.error);             // ok\n  return save(5);                           // ok\n  items.forEach(async (i) => { await save(i); }); // L17\n  fetch(\'/x\');                              // L18 floating\n  fetch(\'/y\').then(r => r.json());          // L19 then w/o catch\n  fetch(\'/z\').then(r => r.json()).catch(e => e); // ok\n  Promise.all([save(1)]);                   // L21\n  await Promise.all([save(1)]);             // ok\n  const p = save(6);                        // ok (assigned: not flagged by design)\n  // save(7);  "save(8)";\n}\nconst w = fs.createWriteStream(\'out.txt\');          // L26 never closed\nconst ok1 = fs.createWriteStream(\'o2.txt\'); ok1.end();\nconst ok2 = fs.createWriteStream(\'o3.txt\'); src.pipe(ok2);\nconst sock = net.createConnection(80);              // L29 never closed\nconst ok3 = new WebSocket(u); ok3.close();\nconst rs = fs.createReadStream(\'r\');                // read streams: not flagged\n'
+
+    def _hits(self, rel):
+        findings = self.scan_files({rel: self.FIXTURE})
+        return sorted((f.rule_id, f.line) for f in findings if f.rule_id in ("RS-ASYNC-001", "RS-ASYNC-002", "RS-RES-001"))
+
+    def test_expected_findings(self):
+        self.assertEqual(self._hits("a.js"), [
+            ("RS-ASYNC-001", 5), ("RS-ASYNC-001", 10),                       # *Sync inside async (nested sync fn and sync fn are fine)
+            ("RS-ASYNC-002", 13), ("RS-ASYNC-002", 18), ("RS-ASYNC-002", 19), ("RS-ASYNC-002", 20), ("RS-ASYNC-002", 22),
+            ("RS-RES-001", 27), ("RS-RES-001", 30)])                         # unclosed write stream and socket
+
+    def test_not_flagged(self):
+        lines = {line for _, line in self._hits("a.js")}
+        for ok in (6, 7, 11, 14, 15, 16, 17, 21, 23, 24, 25, 28, 29, 31, 32):
+            self.assertNotIn(ok, lines, "line %d should not be flagged" % ok)
+
+    def test_handled_or_returned_promises_are_not_floating(self):
+        src = ("const attempt = (auth) =>\n  fetch(url, { headers: auth });\n"
+               "const g = () => fetch(u).then((r) => r.json(), (e) => null);\n"
+               "function h() {\n  fetch(a).then(ok, onError);\n  fetch(b).then(ok).catch(log);\n  fetch(c).finally(done).catch(log);\n}\n")
+        self.assertEqual([f.line for f in self.scan_files({"a.js": src}) if f.rule_id == "RS-ASYNC-002"], [])
+
+    def test_unhandled_then_chain_is_floating(self):
+        src = "function h() {\n  fetch(a).then(ok);\n  load().then((x) => x);\n}\nasync function load() {}\n"
+        self.assertEqual(sorted(f.line for f in self.scan_files({"a.js": src}) if f.rule_id == "RS-ASYNC-002"), [2, 3])
+
+    def test_test_files_are_skipped(self):
+        self.assertEqual(self._hits("a.test.js"), [])
+
+    def test_rules_can_be_disabled_and_suppressed(self):
+        src = "async function f() {\n  // reposentry: ignore RS-ASYNC-001\n  fs.readFileSync('a');\n  fs.readFileSync('b');\n}\n"
+        hits = [f.line for f in self.scan_files({"a.js": src}) if f.rule_id == "RS-ASYNC-001"]
+        self.assertEqual(hits, [4])
+        root = self.make_project({"a.js": self.FIXTURE})
+        _, out, _ = self.run_cli([root, "--format", "json", "--ignore-rules", "RS-ASYNC-001", "--fail-on-severity", "critical"])
+        ids = {f["rule_id"] for f in json.loads(out)["findings"]}
+        self.assertNotIn("RS-ASYNC-001", ids)
+        self.assertIn("RS-ASYNC-002", ids)
+
+    def test_comments_and_strings_do_not_trigger(self):
+        src = "async function f() {\n  // fs.readFileSync('a'); save(1);\n  const s = \"fs.readFileSync('a')\";\n}\nasync function save() {}\n"
+        self.assertEqual([f for f in self.scan_files({"a.js": src}) if f.rule_id.startswith("RS-ASYNC")], [])
 
 
 class TestJsRobustnessAndCli(_ProjectMixin, unittest.TestCase):
