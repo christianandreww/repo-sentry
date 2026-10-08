@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import collections
 import contextlib
 import dataclasses
@@ -18,6 +19,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import stat as statmod
 import subprocess
@@ -26,7 +28,7 @@ import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -166,6 +168,18 @@ for _r in (
          "Rotate the credential immediately; rewriting history (git filter-repo / BFG) is optional and "
          "only helps if no one has cloned the repo.",
          "all"),
+    Rule("RS-SEC-006", "Insecure configuration (JS/TS)", "medium", "security",
+         "JS/TS: pattern-based, approximate. TLS verification disabled (rejectUnauthorized: false, "
+         "NODE_TLS_REJECT_UNAUTHORIZED='0') [high]; createHash('md5'|'sha1') [medium; fine for non-security "
+         "checksums]; Math.random() near token/secret/password/nonce/session/csrf/otp identifiers [medium]; "
+         "JWT algorithms containing 'none' [high]; CORS origin '*' with credentials: true [medium]; "
+         "dangerouslySetInnerHTML with non-constant __html [high] (constant: low); fs paths built from "
+         "req/params/query/body/argv [medium, low confidence]; new RegExp() from request data [low]. "
+         "Severity is downgraded one level in test files.",
+         "Keep TLS verification on, hash credentials with bcrypt/scrypt/argon2, generate secrets with "
+         "crypto.randomBytes, pin JWT algorithms, avoid wildcard CORS with credentials, sanitize HTML, "
+         "and validate user-controlled paths and patterns.",
+         "js"),
     Rule("RS-SYS-001", "File could not be parsed", "low", "system",
          "The file could not be read, decoded or parsed (SyntaxError, encoding error). "
          "The scan continues; the file is still pattern-scanned for secrets.",
@@ -234,8 +248,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "entropy_base64": 4.5,
     "min_secret_length": 20,
 }
-DEFAULT_IGNORE_DIRS: List[str] = [".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build"]
-DEFAULT_IGNORE_GLOBS: List[str] = ["*.min.js", "*.lock"]
+DEFAULT_IGNORE_DIRS: List[str] = [".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
+                                  "coverage", ".next", ".nuxt", "out"]
+DEFAULT_IGNORE_GLOBS: List[str] = ["*.min.js", "*.min.css", "*.map", "*.lock"]
 DEFAULT_PACKAGE_ROOTS: List[str] = ["src", "."]
 CONFIG_KEYS = {
     "ignore_dirs", "ignore_globs", "respect_gitignore", "thresholds", "severity_overrides",
@@ -992,7 +1007,7 @@ def _is_literal_arg(arg: str) -> bool:
     return True
 
 
-JS_EXEC_RE = re.compile(r"(?<![\w$.])(?:(?:child_process|cp|childProcess|proc)\s*\.\s*)?(exec|execSync)\s*\(")
+JS_EXEC_RE = re.compile(r"(?<![\w$.])(?:(?:child_process|cp|childProcess|proc|sh|shell|shelljs|execa)\s*\.\s*)?(exec|execSync)\s*\(")
 JS_EXEC_MEMBER_RE = re.compile(r"\.\s*(exec|execSync)\s*\(")
 JS_SPAWN_RE = re.compile(r"(?<![\w$.])(spawn|spawnSync|execFile|execFileSync)\s*\(")
 JS_EVAL_RE = re.compile(r"(?<![\w$.])eval\s*\(")
@@ -1012,15 +1027,19 @@ def _sev_for_arg(constant: bool) -> str:
     return "medium" if constant else "critical"
 
 
-def scan_pattern_sinks(sf: SourceFile, emit) -> None:
+def scan_pattern_sinks(sf: SourceFile, emit, masked: Optional[str] = None) -> None:
     """RS-SEC-003 / RS-SEC-004 for non-Python languages. Pattern-based,
-    confidence is low or medium by design."""
-    stripped = strip_comments(sf.text, sf.lang).splitlines()
+    confidence is low or medium by design. JS/TS runs on lexically masked
+    text (comments, strings, template text and regex bodies blanked)."""
+    if sf.lang == "js":
+        stripped = (masked if masked is not None else js_mask(sf.text, jsx=js_allows_jsx(sf.rel))).splitlines()
+    else:
+        stripped = strip_comments(sf.text, sf.lang).splitlines()
     rem3 = RULES["RS-SEC-003"].remediation
     rem4 = RULES["RS-SEC-004"].remediation
     file_text = sf.text
     if sf.lang == "js":
-        uses_child_process = "child_process" in file_text
+        uses_child_process = bool(_JS_SHELL_IMPORT_RE.search(file_text))
         for lineno, line in enumerate(stripped, 1):
             if not line.strip():
                 continue
@@ -1104,6 +1123,894 @@ def scan_pattern_sinks(sf: SourceFile, emit) -> None:
             for m in SH_RCE_RE.finditer(line):
                 emit(Finding("RS-SEC-003", "critical", "low", sf.rel, lineno, m.start() + 1,
                              "sh -c with variable interpolation", sf.snippet(lineno), rem3))
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: lexical masking (foundation for all JS/TS rules)
+# --------------------------------------------------------------------------
+# Identifiers after which a `/` starts a regex literal rather than a division.
+_JS_REGEX_KEYWORDS = frozenset((
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case",
+    "do", "else", "yield", "await", "extends", "export", "default",
+))
+_JS_EXPR_CHUNK_RE = re.compile(r"[^'\"`/{}<]+")
+_JS_JSX_TEXT_CHUNK_RE = re.compile(r"[^<{\r\n]+")
+_JS_JSX_TAG_CHUNK_RE = re.compile(r"[^'\"{}<>/]+")
+_JS_TPL_CHUNK_RE = re.compile(r"[^`$\\\r\n]+")
+_JS_JSX_TAG_RE = re.compile(r"<(>|[A-Za-z_$][\w$.:\-]*)")
+_JS_NOT_NEWLINE_RE = re.compile(r"[^\r\n]")
+
+
+def _js_prev_is_value(text: str, last: int) -> bool:
+    """True when the last significant code character ends a value (so a
+    following `/` is a division), False when an operand is expected (regex)."""
+    if last < 0:
+        return False
+    ch = text[last]
+    if ch in ")]}":
+        return True
+    if ch.isalnum() or ch in "_$":
+        k = last
+        while k > 0 and (text[k - 1].isalnum() or text[k - 1] in "_$"):
+            k -= 1
+        word = text[k:last + 1]
+        if word[0].isdigit():
+            return True
+        return word not in _JS_REGEX_KEYWORDS
+    return False
+
+
+def _js_looks_like_jsx(text: str, i: int) -> bool:
+    """Cheap JSX heuristic at a `<` in expression position: `<>`, or `<Tag`
+    followed by `>`, `/`, `{`, an attribute name or a line break. `<T,>`,
+    `a < b` and `Array<string>` are rejected."""
+    m = _JS_JSX_TAG_RE.match(text, i)
+    if not m:
+        return False
+    if m.group(1) == ">":
+        return True
+    k = m.end()
+    n = len(text)
+    while k < n and text[k] in " \t\r\n":
+        k += 1
+    if k >= n:
+        return True
+    nxt = text[k]
+    return nxt in ">/{" or nxt.isalpha() or nxt in "_$"
+
+
+def js_allows_jsx(rel: str) -> bool:
+    """JSX is possible in .js/.jsx/.mjs/.cjs/.tsx; plain .ts/.mts/.cts use
+    `<Type>value` assertions instead, so JSX detection is off there."""
+    return os.path.splitext(rel)[1].lower() not in (".ts", ".mts", ".cts")
+
+
+def js_mask(text: str, jsx: bool = True) -> str:
+    """Return `text` with the contents of comments, string literals, template
+    literal text, regex literals and JSX text replaced by spaces. Length and
+    every line break are preserved exactly; delimiters (quotes, backticks,
+    regex slashes, `${` `}`) are kept. Code inside `${ ... }` stays visible
+    and is masked recursively. Never raises; an unterminated template,
+    comment or JSX element is masked to the end of the file, an unterminated
+    string or regex to the end of its line. Linear time."""
+    n = len(text)
+    out = list(text)
+
+    def blank(a: int, b: int) -> None:
+        if b > a:
+            out[a:b] = list(_JS_NOT_NEWLINE_RE.sub(" ", text[a:b]))
+
+    # context stack entries: ["expr", brace_depth] | ["tpl"] | ["jsx", element_depth, mode]
+    stack: List[List[object]] = [["expr", 0]]
+    i = 0
+    last = -1  # index of the last significant (unmasked, non-space) code character
+    while i < n:
+        ctx = stack[-1]
+        kind = ctx[0]
+        c = text[i]
+        if kind == "tpl":
+            if c == "`":
+                stack.pop()
+                last = i
+                i += 1
+            elif c == "\\":
+                blank(i, min(n, i + 2))
+                i += 2
+            elif c == "$" and i + 1 < n and text[i + 1] == "{":
+                stack.append(["expr", 0])
+                i += 2
+            elif c in "\r\n":
+                i += 1
+            else:
+                m = _JS_TPL_CHUNK_RE.match(text, i)
+                j = m.end() if m else i + 1
+                blank(i, j)
+                i = j
+            continue
+        if kind == "jsx":
+            mode = ctx[2]
+            if mode == "text":
+                if c == "{":
+                    stack.append(["expr", 0])
+                    i += 1
+                elif c == "<":
+                    if text.startswith("</", i):
+                        ctx[2] = "close"
+                        i += 2
+                    else:
+                        ctx[2] = "tag"
+                        i += 1
+                elif c in "\r\n":
+                    i += 1
+                else:
+                    m = _JS_JSX_TEXT_CHUNK_RE.match(text, i)
+                    j = m.end() if m else i + 1
+                    blank(i, j)
+                    i = j
+                continue
+            if mode == "close":
+                j = text.find(">", i)
+                if j == -1:
+                    j = n - 1
+                i = j + 1
+                ctx[1] = int(ctx[1]) - 1  # type: ignore[call-overload]
+                if int(ctx[1]) <= 0:  # type: ignore[call-overload]
+                    stack.pop()
+                    last = j
+                else:
+                    ctx[2] = "text"
+                continue
+            # mode == "tag": inside `<Tag ... >`
+            if c in "'\"":
+                j = i + 1
+                while j < n and text[j] != c:
+                    j += 1
+                blank(i + 1, j)
+                i = j + 1
+            elif c == "{":
+                stack.append(["expr", 0])
+                i += 1
+            elif c == "/" and i + 1 < n and text[i + 1] == ">":
+                i += 2
+                if int(ctx[1]) <= 0:  # type: ignore[call-overload]
+                    stack.pop()
+                    last = i - 1
+                else:
+                    ctx[2] = "text"
+            elif c == ">":
+                i += 1
+                ctx[1] = int(ctx[1]) + 1  # type: ignore[call-overload]
+                ctx[2] = "text"
+            elif c in "<}/":
+                i += 1
+            else:
+                m = _JS_JSX_TAG_CHUNK_RE.match(text, i)
+                i = m.end() if m else i + 1
+            continue
+        # kind == "expr"
+        if c == "'" or c == '"':
+            j = i + 1
+            while j < n:
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == c or ch == "\n" or ch == "\r":
+                    break
+                j += 1
+            if j >= n:
+                blank(i + 1, n)
+                i = n
+            elif text[j] == c:
+                blank(i + 1, j)
+                last = j
+                i = j + 1
+            else:  # unterminated string: masked to the end of its line
+                blank(i + 1, j)
+                last = j - 1
+                i = j
+        elif c == "`":
+            stack.append(["tpl"])
+            i += 1
+        elif c == "/":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt == "/":
+                j = text.find("\n", i)
+                if j == -1:
+                    j = n
+                blank(i, j)
+                i = j
+            elif nxt == "*":
+                j = text.find("*/", i + 2)
+                j = n if j == -1 else j + 2
+                blank(i, j)
+                i = j
+            elif _js_prev_is_value(text, last):
+                last = i
+                i += 1
+            else:  # regex literal
+                j = i + 1
+                in_class = False
+                while j < n:
+                    ch = text[j]
+                    if ch == "\\":
+                        j += 2
+                        continue
+                    if ch == "\n" or ch == "\r":
+                        break
+                    if in_class:
+                        if ch == "]":
+                            in_class = False
+                    elif ch == "[":
+                        in_class = True
+                    elif ch == "/":
+                        break
+                    j += 1
+                if j < n and text[j] == "/":
+                    blank(i + 1, j)
+                    k = j + 1
+                    while k < n and (text[k].isalpha() or text[k] in "_$"):
+                        k += 1
+                    last = k - 1
+                    i = k
+                else:
+                    j = min(j, n)
+                    blank(i + 1, j)
+                    last = j - 1
+                    i = j
+        elif c == "{":
+            ctx[1] = int(ctx[1]) + 1  # type: ignore[call-overload]
+            last = i
+            i += 1
+        elif c == "}":
+            if int(ctx[1]) > 0:  # type: ignore[call-overload]
+                ctx[1] = int(ctx[1]) - 1  # type: ignore[call-overload]
+                last = i
+            elif len(stack) > 1:
+                stack.pop()
+            else:
+                last = i
+            i += 1
+        elif c == "<":
+            if jsx and not _js_prev_is_value(text, last) and _js_looks_like_jsx(text, i):
+                stack.append(["jsx", 0, "tag"])
+                i += 1
+            else:
+                last = i
+                i += 1
+        else:
+            m = _JS_EXPR_CHUNK_RE.match(text, i)
+            j = m.end() if m else i + 1
+            stripped = text[i:j].rstrip()
+            if stripped:
+                last = i + len(stripped) - 1
+            i = j
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: approximate function discovery and metrics
+# --------------------------------------------------------------------------
+_JS_CONTROL_WORDS = frozenset((
+    "if", "for", "while", "switch", "catch", "with", "function", "return", "else", "do", "try",
+    "finally", "new", "typeof", "await", "yield", "delete", "void", "throw", "in", "of", "instanceof",
+    "case", "default", "import", "export", "class", "extends", "super", "async", "this", "let", "const",
+    "var", "type", "interface", "enum", "declare", "namespace", "module", "satisfies", "as", "is",
+))
+_JS_FUNC_KW_RE = re.compile(r"(?<![\w$.@])(?:async\s+)?function\b\s*\*?\s*(?:([A-Za-z_$][\w$]*)\s*)?(?:<[^<>()]*>\s*)?\(")
+_JS_ARROW_RE = re.compile(r"=>\s*\{")
+_JS_METHOD_RE = re.compile(
+    r"(?<![\w$.@#])(?:(?:public|private|protected|static|async|readonly|override|abstract|declare|get|set)\s+)*"
+    r"\*?\s*(#?[A-Za-z_$][\w$]*)\s*\??\s*(?:<[^<>()]*>\s*)?\(")
+_JS_EXPORT_DEFAULT_TAIL_RE = re.compile(r"export\s+default\s*$")
+_JS_ARROW_NAME_RES = (
+    re.compile(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*$"),
+    re.compile(r"([A-Za-z_$][\w$.]*)\s*(?::[^=:]*)?=\s*$"),
+    re.compile(r"([A-Za-z_$][\w$]*)\s*:\s*$"),
+)
+_JS_CC_IF_RE = re.compile(r"(?<![\w$.])if\s*\(")
+_JS_CC_FOR_RE = re.compile(r"(?<![\w$.])for\s*(?:await\s*)?\(")
+_JS_CC_WHILE_RE = re.compile(r"(?<![\w$.])while\s*\(")
+_JS_CC_CASE_RE = re.compile(r"(?<![\w$.])case\b")
+_JS_CC_CATCH_RE = re.compile(r"(?<![\w$.])catch\b")
+_JS_CC_LOGIC_RE = re.compile(r"&&|\|\||\?\?")
+_JS_CC_TERNARY_RE = re.compile(r"(?<![?])\?(?![.?:,)\]>])")
+_JS_BLOCK_KW_RE = re.compile(r"(?<![\w$.])(if|for|while|do|switch|try)\b")
+_JS_EMPTY_CATCH_RE = re.compile(r"(?<![\w$.])catch\s*(?:\([^()]*\))?\s*\{\s*\}")
+_JS_TEST_FILE_RE = re.compile(r"(?:^|/)(?:__tests__|__mocks__)/|\.(?:test|spec)\.[cm]?[jt]sx?$", re.IGNORECASE)
+# RS-SEC-006 patterns (run on masked text unless noted)
+_JS_SEC_TLS_RE = re.compile(r"(?<![\w$])rejectUnauthorized\s*:\s*false(?![\w$])")
+_JS_SEC_TLS_ENV_RE = re.compile(  # original text; the value is a string literal
+    r"process\s*\.\s*env\s*(?:\.\s*NODE_TLS_REJECT_UNAUTHORIZED|\[\s*['\"]NODE_TLS_REJECT_UNAUTHORIZED['\"]\s*\])"
+    r"\s*=\s*(['\"])0\1")
+_JS_SEC_HASH_RE = re.compile(r"(?<![\w$])createHash\s*\(\s*(['\"])")
+_JS_SEC_RANDOM_RE = re.compile(r"(?<![\w$.])Math\s*\.\s*random\s*\(")
+_JS_SEC_SECRET_IDENT_RE = re.compile(r"(?<![\w$])[\w$]*(?:token|secret|password|nonce|session|csrf|otp)[\w$]*", re.IGNORECASE)
+_JS_SEC_JWT_ALG_RE = re.compile(r"(?<![\w$])algorithms\s*:\s*\[")
+_JS_SEC_JWT_NONE_RE = re.compile(r"['\"]none['\"]", re.IGNORECASE)
+_JS_SEC_CORS_ORIGIN_RE = re.compile(r"(?<![\w$])origin\s*:\s*(['\"])")
+_JS_SEC_CORS_CRED_RE = re.compile(r"(?<![\w$])credentials\s*:\s*true(?![\w$])")
+_JS_SEC_DSIH_RE = re.compile(r"dangerouslySetInnerHTML\s*=\s*\{\s*\{\s*__html\s*:\s*")
+_JS_SEC_FS_IMPORT_RE = re.compile(r"['\"](?:node:)?fs(?:/promises)?['\"]|\bfs\s*\.\s*promises\b")
+_JS_SEC_FS_CALL_RE = re.compile(
+    r"(?<![\w$])(readFile|readFileSync|createReadStream|createWriteStream|writeFile|writeFileSync|appendFile|"
+    r"appendFileSync|unlink|unlinkSync|readdir|readdirSync|rm|rmSync|rmdir|rmdirSync)\s*\(")
+_JS_SEC_REQ_DATA_RE = re.compile(r"(?<![\w$])(?:req|request)\s*\.|(?<![\w$.])(?:params|query|body|argv)(?![\w$])")
+_JS_SEC_REGEXP_RE = re.compile(r"(?<![\w$.])new\s+RegExp\s*\(")
+_JS_SHELL_IMPORT_RE = re.compile(r"['\"](?:node:)?child_process['\"]|['\"](?:execa|shelljs)['\"]")
+
+
+def _downgrade(severity: str) -> str:
+    return SEVERITIES[max(0, SEVERITY_RANK[severity] - 1)]
+
+
+def js_is_test_file(rel: str) -> bool:
+    return bool(_JS_TEST_FILE_RE.search(rel))
+
+
+def js_is_declaration_file(rel: str) -> bool:
+    return rel.lower().endswith((".d.ts", ".d.mts", ".d.cts"))
+
+
+def js_line_starts(text: str) -> List[int]:
+    starts = [0]
+    pos = text.find("\n")
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = text.find("\n", pos + 1)
+    return starts
+
+
+def js_line_col(starts: Sequence[int], offset: int) -> Tuple[int, int]:
+    line = bisect.bisect_right(starts, offset)
+    return line, offset - starts[line - 1] + 1
+
+
+def _js_match_forward(text: str, i: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket matching text[i] (which must be open_ch), or
+    len(text) when unterminated. Linear, on masked text."""
+    depth = 0
+    n = len(text)
+    k = i
+    while k < n:
+        ch = text[k]
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return n
+
+
+def _js_match_backward(text: str, k: int, open_ch: str, close_ch: str) -> int:
+    depth = 0
+    while k >= 0:
+        ch = text[k]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k -= 1
+    return 0
+
+
+def _js_body_after_params(text: str, close_paren: int) -> int:
+    """Index of the `{` opening a function body after its `)` (skipping a TS
+    return type annotation), or -1 when there is no body (signature only)."""
+    n = len(text)
+    k = close_paren + 1
+    while k < n and text[k] in " \t\r\n":
+        k += 1
+    if k >= n:
+        return -1
+    if text[k] == "{":
+        return k
+    if text[k] != ":":
+        return -1
+    k += 1
+    depth = 0
+    prev = ":"
+    arrow = False  # the previous significant token was `=>`
+    while k < n:
+        ch = text[k]
+        if ch in " \t\r\n":
+            k += 1
+            continue
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == ">":
+            if prev == "=":
+                arrow = True
+                prev = ch
+                k += 1
+                continue
+            depth -= 1
+        elif ch == "{":
+            if depth <= 0:
+                if arrow or prev in ":|&,(<=":
+                    k = _js_match_forward(text, k, "{", "}") + 1
+                    prev = "}"
+                    arrow = False
+                    continue
+                return k
+        elif ch == ";" and depth <= 0:
+            return -1
+        prev = ch
+        arrow = False
+        k += 1
+    return -1
+
+
+def _js_arrow_name(text: str, params_start: int) -> str:
+    pre = text[max(0, params_start - 240):params_start].rstrip()
+    if pre.endswith("async"):
+        pre = pre[:-5].rstrip()
+    if _JS_EXPORT_DEFAULT_TAIL_RE.search(pre):
+        return "default"
+    for rx in _JS_ARROW_NAME_RES:
+        m = rx.search(pre)
+        if m:
+            return m.group(1).split(".")[-1]
+    return "<anonymous>"
+
+
+@dataclasses.dataclass
+class JsFunction:
+    name: str
+    start: int        # offset of the header (keyword, name or parameter list)
+    body_start: int   # offset of the `{`
+    body_end: int     # offset of the matching `}` (len(text) if unterminated)
+    children: List["JsFunction"] = dataclasses.field(default_factory=list)
+
+
+def js_discover_functions(masked: str) -> List[JsFunction]:
+    """Approximate function discovery on masked text: `function` declarations
+    and expressions, arrow functions with block bodies, class/object methods,
+    getters/setters, constructors. Returns functions sorted by body start
+    with parent/child nesting resolved."""
+    found: Dict[int, JsFunction] = {}
+
+    def add(name: str, start: int, body: int) -> None:
+        if body in found:
+            return
+        found[body] = JsFunction(name, start, body, _js_match_forward(masked, body, "{", "}"))
+
+    for m in _JS_FUNC_KW_RE.finditer(masked):
+        close = _js_match_forward(masked, m.end() - 1, "(", ")")
+        body = _js_body_after_params(masked, close)
+        if body < 0:
+            continue
+        name = m.group(1)
+        if not name:
+            name = "default" if _JS_EXPORT_DEFAULT_TAIL_RE.search(masked[max(0, m.start() - 40):m.start()]) else "<anonymous>"
+        add(name, m.start(), body)
+    for m in _JS_METHOD_RE.finditer(masked):
+        name = m.group(1)
+        if name.lstrip("#") in _JS_CONTROL_WORDS:
+            continue
+        close = _js_match_forward(masked, m.end() - 1, "(", ")")
+        body = _js_body_after_params(masked, close)
+        if body < 0 or body in found:
+            continue
+        add(name, m.start(), body)
+    for m in _JS_ARROW_RE.finditer(masked):
+        body = m.end() - 1
+        if body in found:
+            continue
+        k = m.start() - 1
+        while k >= 0 and masked[k] in " \t\r\n":
+            k -= 1
+        if k < 0:
+            continue
+        if masked[k] == ")":
+            ps = _js_match_backward(masked, k, "(", ")")
+        elif masked[k].isalnum() or masked[k] in "_$":
+            ps = k
+            while ps > 0 and (masked[ps - 1].isalnum() or masked[ps - 1] in "_$"):
+                ps -= 1
+        else:
+            continue
+        add(_js_arrow_name(masked, ps), ps, body)
+    funcs = sorted(found.values(), key=lambda f: f.body_start)
+    stack: List[JsFunction] = []
+    for f in funcs:
+        while stack and stack[-1].body_end < f.body_start:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(f)
+        stack.append(f)
+    return funcs
+
+
+def js_own_text(masked: str, start: int, end: int, children: Sequence[JsFunction]) -> str:
+    """masked[start:end] with the spans of nested functions blanked out."""
+    pieces: List[str] = []
+    pos = start
+    for child in children:
+        a = max(child.start, pos)
+        b = min(child.body_end + 1, end)
+        if a < pos or a >= end:
+            continue
+        pieces.append(masked[pos:a])
+        pieces.append(_JS_NOT_NEWLINE_RE.sub(" ", masked[a:b]))
+        pos = b
+    pieces.append(masked[pos:end])
+    return "".join(pieces)
+
+
+def js_complexity(own: str) -> int:
+    """Approximate McCabe complexity of a function's own (masked) text:
+    1 + if + for + while + case + catch + each && || ?? + each ternary."""
+    score = 1
+    for rx in (_JS_CC_IF_RE, _JS_CC_FOR_RE, _JS_CC_WHILE_RE, _JS_CC_CASE_RE, _JS_CC_CATCH_RE, _JS_CC_LOGIC_RE,
+               _JS_CC_TERNARY_RE):
+        score += len(rx.findall(own))
+    return score
+
+
+def js_max_nesting(own: str) -> Tuple[int, int]:
+    """(max depth, offset of the deepest block keyword) for if/for/while/do/
+    switch/try blocks; else/catch/finally do not add depth."""
+    n = len(own)
+    spans: List[Tuple[int, int, int]] = []
+    for m in _JS_BLOCK_KW_RE.finditer(own):
+        k = m.end()
+        while k < n and own[k] in " \t\r\n":
+            k += 1
+        if k >= n:
+            continue
+        if m.group(1) in ("do", "try"):
+            if own[k] != "{":
+                continue
+        else:
+            if own[k] != "(":
+                continue
+            k = _js_match_forward(own, k, "(", ")") + 1
+            while k < n and own[k] in " \t\r\n":
+                k += 1
+            if k >= n or own[k] != "{":
+                continue
+        spans.append((k, _js_match_forward(own, k, "{", "}"), m.start()))
+    spans.sort()
+    stack: List[int] = []
+    best_depth, best_pos = 0, -1
+    for b, e, pos in spans:
+        while stack and stack[-1] <= b:
+            stack.pop()
+        depth = len(stack) + 1
+        if depth > best_depth:
+            best_depth, best_pos = depth, pos
+        stack.append(e)
+    return best_depth, best_pos
+
+
+class JsAnalyzer:
+    """Approximate structural analysis of one JS/TS file on its masked text."""
+
+    def __init__(self, sf: SourceFile, config: Config, emit, enabled: Set[str]) -> None:
+        self.sf = sf
+        self.config = config
+        self.emit = emit
+        self.enabled = enabled
+        self.masked = js_mask(sf.text, jsx=js_allows_jsx(sf.rel))
+        self.starts = js_line_starts(sf.text)
+        self.funcs = js_discover_functions(self.masked)
+        self.test_file = js_is_test_file(sf.rel)
+
+    def _finding(self, rule_id: str, severity: str, confidence: str, offset: int, message: str,
+                 remediation: Optional[str] = None) -> None:
+        line, col = js_line_col(self.starts, offset)
+        self.emit(Finding(rule_id, severity, confidence, self.sf.rel, line, col, message,
+                          self.sf.snippet(line), remediation or RULES[rule_id].remediation))
+
+    def run_quality(self) -> None:
+        th = self.config.thresholds
+        max_cc = th.get("max_cyclomatic_complexity", 10)
+        max_depth = th.get("max_nesting_depth", 4)
+        want_cc = "RS-QUAL-001" in self.enabled
+        want_depth = "RS-QUAL-002" in self.enabled
+        if (want_cc or want_depth) and not self.test_file:
+            for f in self.funcs:
+                own = js_own_text(self.masked, f.body_start + 1, f.body_end, f.children)
+                if want_cc:
+                    cc = js_complexity(own)
+                    if cc > max_cc:
+                        severity = "high" if cc > 2 * max_cc else "medium"
+                        self._finding("RS-QUAL-001", severity, "medium", f.start,
+                                      "Function '%s' has cyclomatic complexity %d (threshold %d; approximate JS/TS estimate)"
+                                      % (f.name, cc, max_cc))
+                if want_depth:
+                    depth, pos = js_max_nesting(own)
+                    if depth > max_depth and pos >= 0:
+                        self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "medium", f.body_start + 1 + pos,
+                                      "Nesting depth %d exceeds %d in function '%s' (approximate JS/TS estimate)"
+                                      % (depth, max_depth, f.name))
+            if want_depth:
+                top = [f for f in self.funcs if not any(f is c for p in self.funcs for c in p.children)]
+                own = js_own_text(self.masked, 0, len(self.masked), top)
+                depth, pos = js_max_nesting(own)
+                if depth > max_depth and pos >= 0:
+                    self._finding("RS-QUAL-002", RULES["RS-QUAL-002"].severity, "medium", pos,
+                                  "Nesting depth %d exceeds %d in module scope (approximate JS/TS estimate)" % (depth, max_depth))
+        if "RS-QUAL-004" in self.enabled:
+            for m in _JS_EMPTY_CATCH_RE.finditer(self.masked):
+                self._finding("RS-QUAL-004", RULES["RS-QUAL-004"].severity, "medium", m.start(),
+                              "Empty catch block silently swallows errors (approximate JS/TS check)")
+
+    def collect_imports(self) -> List["JsImport"]:
+        """Import specifiers found on the masked text (so comments and strings
+        cannot contribute), read back from the original text. `import type`,
+        `export type`, dynamic `import()` and imports inside a function body
+        are soft."""
+        masked, text = self.masked, self.sf.text
+        found: Dict[int, JsImport] = {}
+
+        def inside_function(pos: int) -> bool:
+            return any(f.body_start < pos < f.body_end for f in self.funcs)
+
+        def add(qpos: int, soft: bool) -> None:
+            if qpos in found or qpos >= len(text):
+                return
+            quote = text[qpos]
+            end = text.find(quote, qpos + 1)
+            if end == -1:
+                return
+            spec = text[qpos + 1:end]
+            if not spec or "\n" in spec:
+                return
+            line, col = js_line_col(self.starts, qpos)
+            found[qpos] = JsImport(spec, line, col, soft or inside_function(qpos), self.sf.snippet(line))
+
+        for m in _JS_IMPORT_FROM_RE.finditer(masked):
+            add(m.start(3), bool(_JS_TYPE_ONLY_RE.match(m.group(2))))
+        for m in _JS_IMPORT_SIDE_RE.finditer(masked):
+            add(m.start(1), False)
+        for m in _JS_IMPORT_DYN_RE.finditer(masked):
+            add(m.start(1), True)
+        for m in _JS_REQUIRE_RE.finditer(masked):
+            add(m.start(1), False)
+        return [found[k] for k in sorted(found)]
+
+    # -- RS-SEC-006: insecure configuration -------------------------------
+    def _sec(self, severity: str, confidence: str, offset: int, message: str) -> None:
+        if self.test_file:
+            severity = _downgrade(severity)
+        self._finding("RS-SEC-006", severity, confidence, offset, message + " (JS/TS, approximate)")
+
+    def _enclosing_object(self, offset: int) -> Tuple[int, int]:
+        """Span of the innermost `{ ... }` object literal around `offset` on
+        masked text, or (0, len) when none is found."""
+        masked = self.masked
+        depth = 0
+        k = offset
+        while k >= 0:
+            ch = masked[k]
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                if depth == 0:
+                    return k, _js_match_forward(masked, k, "{", "}")
+                depth -= 1
+            k -= 1
+        return 0, len(masked)
+
+    def _call_arg(self, paren: int, limit: int = 400) -> str:
+        return _extract_first_arg(self.masked[paren:paren + limit], 0)
+
+    def run_security(self) -> None:
+        masked, text = self.masked, self.sf.text
+        for m in _JS_SEC_TLS_RE.finditer(masked):
+            self._sec("high", "medium", m.start(), "TLS certificate verification disabled with rejectUnauthorized: false")
+        for m in _JS_SEC_TLS_ENV_RE.finditer(text):
+            if masked[m.start()] == "p":  # not inside a comment or string
+                self._sec("high", "medium", m.start(), "TLS certificate verification disabled via NODE_TLS_REJECT_UNAUTHORIZED='0'")
+        for m in _JS_SEC_HASH_RE.finditer(masked):
+            q = m.start(1)
+            end = text.find(text[q], q + 1)
+            algo = text[q + 1:end].strip().lower() if end != -1 else ""
+            if algo in ("md5", "sha1", "sha-1"):
+                self._sec("medium", "medium", m.start(),
+                          "Weak hash createHash('%s'); unsuitable for passwords or signatures (fine for non-security checksums)" % algo)
+        if _JS_SEC_RANDOM_RE.search(masked):
+            lines = masked.splitlines()
+            for m in _JS_SEC_RANDOM_RE.finditer(masked):
+                line, _ = js_line_col(self.starts, m.start())
+                window = "\n".join(lines[max(0, line - 4):line + 3])
+                ident = _JS_SEC_SECRET_IDENT_RE.search(window)
+                if ident:
+                    self._sec("medium", "medium", m.start(),
+                              "Math.random() used near '%s'; not cryptographically secure" % ident.group(0))
+        for m in _JS_SEC_JWT_ALG_RE.finditer(masked):
+            close = text.find("]", m.end())
+            if close != -1 and _JS_SEC_JWT_NONE_RE.search(text[m.end():close]):
+                self._sec("high", "medium", m.start(), "JWT verification accepts the 'none' algorithm")
+        for m in _JS_SEC_CORS_ORIGIN_RE.finditer(masked):
+            q = m.start(1)
+            if text[q + 1:q + 3] != "*" + text[q]:
+                continue
+            start, end = self._enclosing_object(m.start())
+            if _JS_SEC_CORS_CRED_RE.search(masked, start, end):
+                self._sec("medium", "medium", m.start(), "CORS wildcard origin '*' combined with credentials: true")
+        for m in _JS_SEC_DSIH_RE.finditer(masked):
+            k = m.end()
+            depth = 0
+            n = len(masked)
+            while k < n and k - m.end() < 400:
+                ch = masked[k]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    break
+                k += 1
+            value = masked[m.end():k].strip()
+            if _is_literal_arg(value):
+                self._sec("low", "medium", m.start(), "dangerouslySetInnerHTML with a constant string")
+            else:
+                self._sec("high", "medium", m.start(), "dangerouslySetInnerHTML with non-constant __html (XSS sink)")
+        if _JS_SEC_FS_IMPORT_RE.search(text):
+            for m in _JS_SEC_FS_CALL_RE.finditer(masked):
+                arg = self._call_arg(m.end() - 1)
+                if _JS_SEC_REQ_DATA_RE.search(arg):
+                    self._sec("medium", "low", m.start(1),
+                              "fs.%s() path built from request data (possible path traversal)" % m.group(1))
+        for m in _JS_SEC_REGEXP_RE.finditer(masked):
+            arg = self._call_arg(m.end() - 1)
+            if _JS_SEC_REQ_DATA_RE.search(arg):
+                self._sec("low", "low", m.start(), "new RegExp() built from request data (ReDoS / pattern injection)")
+
+
+# --------------------------------------------------------------------------
+# JavaScript / TypeScript: import graph (relative specifiers + tsconfig paths)
+# --------------------------------------------------------------------------
+_JS_IMPORT_FROM_RE = re.compile(r"(?<![\w$.])(import|export)\b([^;'\"`=]*?)\bfrom\s*(['\"])")
+_JS_TYPE_ONLY_RE = re.compile(r"\s*type\b(?!\s*,)")
+_JS_IMPORT_SIDE_RE = re.compile(r"(?<![\w$.])import\s*(['\"])")
+_JS_IMPORT_DYN_RE = re.compile(r"(?<![\w$.])import\s*\(\s*(['\"])")
+_JS_REQUIRE_RE = re.compile(r"(?<![\w$.])require\s*\(\s*(['\"])")
+JS_RESOLVE_EXTS: Tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json")
+_JS_TS_ALTERNATIVES: Dict[str, Tuple[str, ...]] = {
+    ".js": (".ts", ".tsx", ".d.ts"), ".jsx": (".tsx",), ".mjs": (".mts",), ".cjs": (".cts",),
+}
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+@dataclasses.dataclass
+class JsImport:
+    specifier: str
+    lineno: int
+    col: int
+    soft: bool
+    snippet: str
+
+
+@dataclasses.dataclass
+class JsModule:
+    rel: str
+    imports: List[JsImport]
+
+
+@dataclasses.dataclass
+class JsPathAliases:
+    base_dir: str                           # directory of the tsconfig/jsconfig, relative to the scan root
+    base_url: Optional[str]                 # compilerOptions.baseUrl, relative to base_dir (None when absent)
+    paths: List[Tuple[str, List[str]]]      # compilerOptions.paths entries in declaration order
+
+
+def parse_jsonc(text: str) -> object:
+    """json.loads for tsconfig-style JSON: comments and trailing commas removed."""
+    stripped = strip_comments(text, "js")
+    stripped = _TRAILING_COMMA_RE.sub(r"\1", stripped)
+    return json.loads(stripped)
+
+
+def load_js_path_aliases(rel: str, text: str, warnings: List[str]) -> Optional[JsPathAliases]:
+    try:
+        data = parse_jsonc(text)
+    except ValueError as exc:
+        warnings.append("%s: cannot parse (%s); path aliases ignored" % (rel, exc))
+        return None
+    if not isinstance(data, dict):
+        warnings.append("%s: expected a JSON object; path aliases ignored" % rel)
+        return None
+    options = data.get("compilerOptions")
+    if not isinstance(options, dict):
+        return None
+    base_url = options.get("baseUrl")
+    if not isinstance(base_url, str) or not base_url.strip():
+        base_url = None
+    raw_paths = options.get("paths")
+    paths: List[Tuple[str, List[str]]] = []
+    if isinstance(raw_paths, dict):
+        for pattern, targets in raw_paths.items():
+            if isinstance(pattern, str) and isinstance(targets, list):
+                paths.append((pattern, [t for t in targets if isinstance(t, str)]))
+    if base_url is None and not paths:
+        return None
+    return JsPathAliases(posixpath.dirname(rel), base_url, paths)
+
+
+def _alias_capture(pattern: str, spec: str) -> Optional[str]:
+    if "*" in pattern:
+        prefix, suffix = pattern.split("*", 1)
+        if spec.startswith(prefix) and spec.endswith(suffix) and len(spec) >= len(prefix) + len(suffix):
+            return spec[len(prefix):len(spec) - len(suffix)]
+        return None
+    return "" if spec == pattern else None
+
+
+def js_module_name(rel: str) -> str:
+    """POSIX relative path without extension (`src/a/index` for src/a/index.ts)."""
+    return posixpath.splitext(rel)[0]
+
+
+def js_layer_name(name: str, package_roots: Sequence[str]) -> str:
+    """Dotted path under the first matching package root, so layer names map
+    to the first path segment under that root."""
+    for root in package_roots:
+        r = root.strip().strip("/").replace("\\", "/")
+        if r in ("", "."):
+            return name.replace("/", ".")
+        if name.startswith(r + "/"):
+            return name[len(r) + 1:].replace("/", ".")
+    return name.replace("/", ".")
+
+
+class JsModuleResolver:
+    def __init__(self, known_rels: Iterable[str], aliases: Sequence[JsPathAliases]) -> None:
+        self.known: Set[str] = set(known_rels)
+        self.aliases = list(aliases)
+
+    def _try(self, base: str) -> Optional[str]:
+        if base.startswith("../") or base in ("..", ".", ""):
+            return None
+        if base in self.known:
+            return base
+        for ext in JS_RESOLVE_EXTS:
+            if base + ext in self.known:
+                return base + ext
+        stem, ext = posixpath.splitext(base)
+        for alt in _JS_TS_ALTERNATIVES.get(ext, ()):
+            if stem + alt in self.known:
+                return stem + alt
+        for ext in JS_RESOLVE_EXTS:
+            cand = base + "/index" + ext
+            if cand in self.known:
+                return cand
+        return None
+
+    def resolve(self, from_rel: str, spec: str) -> Optional[str]:
+        """Resolve a specifier to a known file's relative path, or None for
+        bare package specifiers, absolute paths and unknown files."""
+        if spec.startswith(("./", "../")) or spec in (".", ".."):
+            return self._try(posixpath.normpath(posixpath.join(posixpath.dirname(from_rel), spec)))
+        if spec.startswith("/") or spec.startswith("node:"):
+            return None
+        for al in self.aliases:
+            root = posixpath.normpath(posixpath.join(al.base_dir, al.base_url or ".")) if (al.base_dir or al.base_url) else "."
+            for pattern, targets in al.paths:
+                captured = _alias_capture(pattern, spec)
+                if captured is None:
+                    continue
+                for target in targets:
+                    cand = target.replace("*", captured, 1) if "*" in target else target
+                    hit = self._try(posixpath.normpath(posixpath.join(root, cand)))
+                    if hit:
+                        return hit
+            if al.base_url is not None:
+                hit = self._try(posixpath.normpath(posixpath.join(root, spec)))
+                if hit:
+                    return hit
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1295,6 +2202,7 @@ class ModuleRecord:
     rel: str
     is_package: bool
     imports: List[ImportRecord] = dataclasses.field(default_factory=list)
+    layer_name: str = ""  # dotted name used for layer / forbidden-import matching (defaults to name)
 
 
 class ScopeUsage:
@@ -1991,12 +2899,15 @@ class ModuleGraph:
         self.config = config
         self.emit = emit
         self.known: Set[str] = set(self.records)
+        self.layer_names: Dict[str, str] = {n: (r.layer_name or n) for n, r in self.records.items()}
         self.hard: Dict[str, Set[str]] = collections.defaultdict(set)
         self.all: Dict[str, Set[str]] = collections.defaultdict(set)
         self.edge_info: Dict[Tuple[str, str], ImportRecord] = {}
 
     def _resolve_candidates(self, rec: ModuleRecord, imp: ImportRecord) -> List[str]:
         targets: List[str] = []
+        if imp.level < 0:  # pre-resolved edge (JS/TS graph)
+            return [imp.module] if imp.module in self.known else []
         if imp.level == 0 and not imp.names:
             # import a.b.c -> longest known prefix
             parts = (imp.module or "").split(".")
@@ -2087,23 +2998,25 @@ class ModuleGraph:
         if not layers and not forbidden:
             return
         for src in sorted(self.all):
-            src_parts = src.split(".")
-            src_layer = _layer_of(src, layers) if layers else None
+            lsrc = self.layer_names[src]
+            src_parts = lsrc.split(".")
+            src_layer = _layer_of(lsrc, layers) if layers else None
             for dst in sorted(self.all[src]):
                 if dst == src:
                     continue
                 imp = self.edge_info[(src, dst)]
                 rec = self.records[src]
-                dst_parts = dst.split(".")
+                ldst = self.layer_names[dst]
+                dst_parts = ldst.split(".")
                 if src_layer is not None:
-                    dst_layer = _layer_of(dst, layers)
+                    dst_layer = _layer_of(ldst, layers)
                     if dst_layer is not None and dst_layer < src_layer:
                         self.emit(Finding("RS-ARCH-002", RULES["RS-ARCH-002"].severity, "high", rec.rel, imp.lineno,
                                           imp.col, "Layer '%s' must not import layer '%s' (%s -> %s)"
                                           % (layers[src_layer], layers[dst_layer], src, dst), imp.snippet,
                                           RULES["RS-ARCH-002"].remediation))
                 for rule in forbidden:
-                    if _module_matches(src, src_parts, rule["from"]) and _module_matches(dst, dst_parts, rule["to"]):
+                    if _module_matches(lsrc, src_parts, rule["from"]) and _module_matches(ldst, dst_parts, rule["to"]):
                         self.emit(Finding("RS-ARCH-002", RULES["RS-ARCH-002"].severity, "high", rec.rel, imp.lineno,
                                           imp.col, "Forbidden import: '%s' must not import '%s' (%s -> %s)"
                                           % (rule["from"], rule["to"], src, dst), imp.snippet,
@@ -2153,8 +3066,11 @@ class Scanner:
         self.suppressed = 0
         self.scanned = 0
         self.modules: List[ModuleRecord] = []
+        self.js_modules: List[JsModule] = []
+        self.js_aliases: List[JsPathAliases] = []
+        self.js_known: Set[str] = set()
         self._directives: Dict[str, Dict[int, Set[str]]] = {}
-        self._seen: Set[Tuple[str, str, int, int, str]] = set()
+        self._seen: Set[Tuple[str, str, int, int]] = set()
         self._current: Optional[SourceFile] = None
         self.indents: Dict[Tuple[str, int], int] = {}
 
@@ -2178,8 +3094,8 @@ class Scanner:
                 if ids and ("*" in ids or finding.rule_id in ids):
                     self.suppressed += 1
                     return
-        key = (finding.rule_id, finding.file, finding.line, finding.col, finding.message)
-        if key in self._seen:
+        key = (finding.rule_id, finding.file, finding.line, finding.col)
+        if key in self._seen:  # never report the same (rule, file, line, col) twice
             return
         self._seen.add(key)
         self.findings.append(finding)
@@ -2198,6 +3114,8 @@ class Scanner:
         self._current = None
         if self.modules and ("RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled):
             ModuleGraph(self.modules, self.config, self._emit).report()
+        if self.js_modules and ("RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled):
+            self._report_js_graph()
         self.findings.sort(key=Finding.sort_key)
         return ScanResult(self.findings, self.scanned, self.warnings, self.suppressed, self.indents)
 
@@ -2228,6 +3146,13 @@ class Scanner:
         if decode_error is not None:
             self._sys_finding(entry.rel, 1, "File is not valid UTF-8 (%s); scanned with replacement characters"
                               % decode_error.reason)
+        base_name = os.path.basename(entry.rel).lower()
+        if base_name in ("tsconfig.json", "jsconfig.json"):
+            aliases = load_js_path_aliases(entry.rel, text, self.warnings)
+            if aliases is not None:
+                self.js_aliases.append(aliases)
+        if lang == "js":
+            self.js_known.add(entry.rel)
         entropy_enabled = ("RS-SEC-002" in self.enabled and not is_lockfile(entry.rel)
                            and not is_minified(entry.rel, sf.lines))
         if "RS-SEC-001" in self.enabled or entropy_enabled:
@@ -2247,9 +3172,51 @@ class Scanner:
             record = analyzer.run()
             if record.name:
                 self.modules.append(record)
-        elif lang in ("js", "c", "shell"):
+        elif lang == "js":
+            self._scan_js(sf)
+        elif lang in ("c", "shell"):
             if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
                 scan_pattern_sinks(sf, self._emit)
+
+    def _scan_js(self, sf: SourceFile) -> None:
+        """JS/TS: masked-text structural rules, sinks and (later) imports.
+        Declaration files and minified/bundled files only get secret scanning."""
+        if js_is_declaration_file(sf.rel) or is_minified(sf.rel, sf.lines):
+            return
+        try:
+            analyzer = JsAnalyzer(sf, self.config, self._emit, self.enabled)
+        except (RecursionError, MemoryError, ValueError, IndexError) as exc:
+            self._sys_finding(sf.rel, 1, "JS/TS file could not be tokenized: %s: %s" % (type(exc).__name__, exc))
+            return
+        analyzer.run_quality()
+        if "RS-SEC-003" in self.enabled or "RS-SEC-004" in self.enabled:
+            scan_pattern_sinks(sf, self._emit, analyzer.masked)
+        if "RS-SEC-006" in self.enabled:
+            analyzer.run_security()
+        if "RS-ARCH-001" in self.enabled or "RS-ARCH-002" in self.enabled:
+            self.js_modules.append(JsModule(sf.rel, analyzer.collect_imports()))
+
+    def _report_js_graph(self) -> None:
+        """Build the JS/TS module graph from pre-resolved edges and reuse the
+        Python cycle / layer reporting."""
+        resolver = JsModuleResolver(self.js_known, self.js_aliases)
+        roots = self.config.package_roots
+        name_of = {rel: js_module_name(rel) for rel in self.js_known}
+        records: List[ModuleRecord] = []
+        with_record: Set[str] = set()
+        for jm in self.js_modules:
+            name = name_of[jm.rel]
+            rec = ModuleRecord(name, jm.rel, False, [], js_layer_name(name, roots))
+            for imp in jm.imports:
+                target = resolver.resolve(jm.rel, imp.specifier)
+                if target is None or target not in name_of:
+                    continue
+                rec.imports.append(ImportRecord(name_of[target], [], -1, imp.lineno, imp.col, imp.soft, imp.snippet))
+            records.append(rec)
+            with_record.add(jm.rel)
+        for rel in sorted(self.js_known - with_record):
+            records.append(ModuleRecord(name_of[rel], rel, False, [], js_layer_name(name_of[rel], roots)))
+        ModuleGraph(records, self.config, self._emit).report()
 
 
 def scan(root: str, config: Optional[Config] = None, rules: Optional[Set[str]] = None,
@@ -2548,9 +3515,13 @@ def render_rule_catalog() -> str:
         out.append("    languages: %s" % rule.languages)
         out.append("    %s" % rule.description)
     out.append("")
-    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript, C/C++ and shell")
-    out.append("files are scanned with regular-expression patterns only (RS-SEC-003, RS-SEC-004 and the")
-    out.append("secret rules); those findings carry confidence low or medium.")
+    out.append("Python files are analysed with the `ast` module. JavaScript/TypeScript files are lexically")
+    out.append("masked (comments, strings, template text, regex literals and JSX text blanked) and analysed")
+    out.append("approximately: brace-matched function discovery feeds RS-QUAL-001/002/004, a relative-import")
+    out.append("graph with tsconfig/jsconfig path aliases feeds RS-ARCH-001/002, and RS-SEC-003/004/006 are")
+    out.append("pattern-based on the masked code. JS/TS findings carry confidence low or medium. C/C++ and")
+    out.append("shell files are scanned with regular-expression patterns only (RS-SEC-003, RS-SEC-004 and")
+    out.append("the secret rules); those findings also carry confidence low or medium.")
     out.append("Suppress a finding with a comment `reposentry: ignore RS-XXX-NNN` on the same or the")
     out.append("preceding line, or record known findings with --write-baseline / --baseline.")
     return "\n".join(out) + "\n"
@@ -3358,6 +4329,505 @@ class TestRobustness(_ProjectMixin, unittest.TestCase):
         self.assertTrue(gi.is_ignored("root_only.txt", False))
         self.assertFalse(gi.is_ignored("sub/root_only.txt", False))
         self.assertTrue(gi.is_ignored("docs/a/b/c.md", False))
+
+
+class TestJsMasking(_ProjectMixin, unittest.TestCase):
+    TRICKY = [
+        "const r = /[/]x\\/y/g; const d = (a + b) / 2 / c; var s = a / b / c;\n",
+        "const x = (a) / 2;\nconst re = x.replace(/\\/+/g, '/');\n",
+        "const t = `a ${b ? `c ${d ? `e ${f}` : 'g'}` : 'h'} i`;\nnext();\n",
+        "function App() {\n  return <p className='x'>don't {name} won't</p>;\n}\nconst y = exec(cmd);\n",
+        "const s = 'unterminated\nconst after = eval(z);\n",
+        "const a: Array<string> = []; if (a < b > c) {} const m = new Map<string, number>();\nrun(x);\n",
+    ]
+
+    def test_comments_strings_and_templates_are_masked(self):
+        src = "// eval(x)\nconst s = \"exec(cmd)\";\nconst t = `eval(x)`;\nconst u = `pre ${eval(y)} post`;\n"
+        masked = js_mask(src)
+        self.assertEqual(len(masked), len(src))
+        self.assertNotIn("eval(x)", masked)
+        self.assertNotIn("exec(cmd)", masked)
+        self.assertIn("eval(y)", masked)
+        self.assertIn('"', masked)
+        self.assertIn("`", masked)
+        self.assertEqual([i for i, ch in enumerate(masked) if ch == "\n"], [i for i, ch in enumerate(src) if ch == "\n"])
+
+    def test_length_and_newlines_preserved_on_tricky_inputs(self):
+        for src in self.TRICKY:
+            masked = js_mask(src)
+            self.assertEqual(len(masked), len(src), src)
+            self.assertEqual([i for i, ch in enumerate(masked) if ch == "\n"],
+                             [i for i, ch in enumerate(src) if ch == "\n"], src)
+            crlf = src.replace("\n", "\r\n")
+            masked_crlf = js_mask(crlf)
+            self.assertEqual(len(masked_crlf), len(crlf))
+            self.assertEqual(masked_crlf.count("\r\n"), crlf.count("\r\n"))
+
+    def test_regex_versus_division(self):
+        masked = js_mask(self.TRICKY[0])
+        self.assertNotIn("[/]x", masked)
+        self.assertIn("(a + b) / 2 / c", masked)
+        self.assertIn("a / b / c", masked)
+        masked = js_mask(self.TRICKY[1])
+        self.assertIn("(a) / 2", masked)
+        self.assertIn("x.replace(/", masked)
+        self.assertNotIn("\\/+", masked)
+        masked = js_mask("const n = total / count;\nreturn /ab+c/i.test(s) ? 1 : 2;\n")
+        self.assertIn("total / count", masked)
+        self.assertNotIn("ab+c", masked)
+        self.assertIn(".test(s)", masked)
+
+    def test_nested_templates_three_deep(self):
+        masked = js_mask(self.TRICKY[2])
+        self.assertEqual(masked, "const t = `  ${b ? `  ${d ? `  ${f}` : ' '}` : ' '}  `;\nnext();\n")
+
+    def test_jsx_with_apostrophes_and_generics(self):
+        masked = js_mask(self.TRICKY[3])
+        self.assertNotIn("don't", masked)
+        self.assertNotIn("won't", masked)
+        self.assertIn("{name}", masked)
+        self.assertIn("exec(cmd)", masked)
+        tsx = ("const items: Array<string> = [];\nfunction List<T,>(props: { rows: T[] }) {\n"
+               "  return (\n    <ul className=\"list\">\n      {props.rows.map((r) => <li key={String(r)}>it's {r} here</li>)}\n"
+               "    </ul>\n  );\n}\nif (a < b && c > d) { exec(cmd); }\nconst m = new Map<string, number>();\n")
+        masked = js_mask(tsx)
+        self.assertEqual(len(masked), len(tsx))
+        self.assertNotIn("it's", masked)
+        self.assertIn("Array<string>", masked)
+        self.assertIn("exec(cmd)", masked)
+        self.assertIn("new Map<string, number>()", masked)
+        self.assertIn("String(r)", masked)
+        plain_ts = js_mask("const v = <any>obj;\nconst w = a < b;\nexec(cmd);\n", jsx=False)
+        self.assertIn("exec(cmd)", plain_ts)
+
+    def test_unterminated_constructs_do_not_derail(self):
+        masked = js_mask(self.TRICKY[4])
+        self.assertIn("eval(z)", masked)
+        masked = js_mask("const t = `never closed\nexec(a);\n")
+        self.assertNotIn("exec(a)", masked)
+        self.assertEqual(len(masked), len("const t = `never closed\nexec(a);\n"))
+        masked = js_mask("/* never closed\nexec(a);\n")
+        self.assertNotIn("exec(a)", masked)
+        masked = js_mask("const r = /never closed\nexec(a);\n")
+        self.assertIn("exec(a)", masked)
+        self.assertEqual(js_mask(""), "")
+
+    def test_masking_is_fast_on_pathological_input(self):
+        import time as _time
+        big_parens = "f" + "(" * 200000 + ")" * 200000 + ";\n"
+        one_line = "var x = 1;" + " a = a + 1;" * 100000 + "\n"
+        tpl = "const t = `" + "${" * 20000 + "x" + "}" * 20000 + "`;\n"
+        started = _time.time()
+        for src in (big_parens, one_line, tpl, "a" * 1000000):
+            masked = js_mask(src)
+            self.assertEqual(len(masked), len(src))
+        self.assertLess(_time.time() - started, 5.0)
+
+    def test_masked_sinks_ignore_comments_and_strings(self):
+        src = ("// eval(x)\nconst s = \"eval(x)\";\nconst t = `eval(x)`;\nconst u = `${eval(y)}`;\neval(x);\n")
+        findings = self.scan_files({"a.js": src})
+        lines = sorted(f.line for f in self.by_rule(findings, "RS-SEC-004"))
+        self.assertEqual(lines, [4, 5])
+
+
+class TestJsStructure(_ProjectMixin, unittest.TestCase):
+    FIXTURE = (
+        "function plain(a) { return [a].map(x => x + 1); }\n"                      # 1 declaration
+        "async function fetchIt(url) { const r = await get(url); return r; }\n"   # 2 async declaration
+        "function* gen() { yield 1; }\n"                                            # 3 generator
+        "const arrow = (a, b) => { return a + b; };\n"                              # 4 arrow with block body
+        "const asyncArrow = async x => { return x; };\n"                           # 5 async arrow, bare param
+        "export default () => { run(); };\n"                                        # 6 export default arrow
+        "class K extends Base {\n"
+        "  constructor(v) { super(); this.v = v; }\n"                               # 7 constructor
+        "  static async #load(id) { return id; }\n"                                 # 8 static async private method
+        "}\n"
+        "const obj = {\n"
+        "  handler(e) {\n"                                                          # 9 object-literal method
+        "    if (e) { while (e) { e--; } }\n"
+        "    for (const k of e) { switch (k) { case 1: break; } }\n"
+        "    try { x(); } catch (err) { log(err); }\n"
+        "    with (e) { y(); }\n"
+        "  },\n"
+        "};\n"
+    )
+
+    def test_function_discovery_names_and_count(self):
+        funcs = js_discover_functions(js_mask(self.FIXTURE))
+        names = [f.name for f in funcs]
+        self.assertEqual(len(funcs), 9)
+        self.assertEqual(names, ["plain", "fetchIt", "gen", "arrow", "asyncArrow", "default", "constructor",
+                                 "#load", "handler"])
+        for bad in ("if", "while", "catch", "for", "switch", "with"):
+            self.assertNotIn(bad, names)
+        self.assertTrue(all(f.body_end > f.body_start for f in funcs))
+
+    def test_typescript_signatures_and_return_types(self):
+        src = ("export function parse<T>(input: string, opts?: Options): { ok: boolean; value: T } {\n"
+               "  if (input) { return { ok: true, value: null as any }; }\n  return { ok: false, value: null as any };\n}\n"
+               "interface Api { load(id: string): Promise<void>; }\n"
+               "abstract class A { abstract run(): void; protected async step(n: number): Promise<number> { return n; } }\n")
+        funcs = js_discover_functions(js_mask(src))
+        self.assertEqual([f.name for f in funcs], ["parse", "step"])
+
+    @staticmethod
+    def metrics(src: str) -> Dict[str, Tuple[int, int]]:
+        masked = js_mask(src)
+        out: Dict[str, Tuple[int, int]] = {}
+        for f in js_discover_functions(masked):
+            own = js_own_text(masked, f.body_start + 1, f.body_end, f.children)
+            out[f.name] = (js_complexity(own), js_max_nesting(own)[0])
+        return out
+
+    def test_exact_complexity_samples(self):
+        # (a) 1 + three `if` = 4
+        a = "function a(x) { if (x) {} if (x > 1) {} if (x > 2) {} return x; }\n"
+        self.assertEqual(self.metrics(a)["a"][0], 4)
+        # (b) 1 + if + else-if (2) + for (1) + && || ?? (3) + ternary (1) + 3 cases (3, default not counted)
+        #     + catch (1) = 12
+        b = ("function b(x, y, z, k) {\n"
+             "  if (x) { } else if (y) { } else { }\n"
+             "  for (const i of z) { }\n"
+             "  const v = x && y || z ?? k;\n"
+             "  const w = x ? 1 : 2;\n"
+             "  switch (k) { case 1: break; case 2: break; case 3: break; default: break; }\n"
+             "  try { run(); } catch (e) { log(e); }\n"
+             "  return v + w;\n}\n")
+        self.assertEqual(self.metrics(b)["b"][0], 12)
+        # (c) optional chaining is not counted, `??` is: 1 + 1 = 2
+        c = "function c(a) { return a?.b ?? c; }\n"
+        self.assertEqual(self.metrics(c)["c"][0], 2)
+        # (d) the nested arrow's `if` belongs to `inner` (1 + 1 = 2), the parent keeps its own `if` (1 + 1 = 2)
+        d = ("function d(a) {\n  const inner = (q) => { if (q) { return 1; } return 2; };\n"
+             "  if (a) { return inner(a); }\n  return 0;\n}\n")
+        m = self.metrics(d)
+        self.assertEqual(m["d"][0], 2)
+        self.assertEqual(m["inner"][0], 2)
+        # TS optional parameters and properties are not ternaries
+        e = "function e(a?: number, b?: string) { const o: { p?: number } = {}; return a ? o : b; }\n"
+        self.assertEqual(self.metrics(e)["e"][0], 2)
+
+    def test_complexity_threshold_via_scan(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return -1;\n}\n" % branches
+        findings = self.scan_files({"a.js": src})
+        hits = self.by_rule(findings, "RS-QUAL-001")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].severity, "medium")
+        self.assertEqual(hits[0].confidence, "medium")
+        self.assertIn("approximate", hits[0].message)
+        self.assertEqual(hits[0].line, 1)
+        findings = self.scan_files({"a.js": src}, {"thresholds": {"max_cyclomatic_complexity": 5}})
+        self.assertEqual(self.by_rule(findings, "RS-QUAL-001")[0].severity, "high")
+
+    def test_nesting_depth(self):
+        deep = ("function f(a) {\n  if (a) {\n    if (a) {\n      if (a) {\n        if (a) {\n"
+                "          if (a) { run(); }\n        }\n      }\n    }\n  }\n}\n")
+        findings = self.scan_files({"a.ts": deep})
+        hits = self.by_rule(findings, "RS-QUAL-002")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("depth 5", hits[0].message)
+        self.assertEqual(hits[0].line, 6)
+        chain = ("function g(a) {\n" + "  if (a === 0) { run(); }\n" +
+                 "".join("  else if (a === %d) { run(); }\n" % i for i in range(1, 7)) + "  else { run(); }\n}\n")
+        self.assertEqual(self.metrics(chain)["g"][1], 1)
+        self.assertEqual(self.by_rule(self.scan_files({"a.ts": chain}), "RS-QUAL-002"), [])
+        four = "function h(a) {\n  for (;;) {\n    while (a) {\n      try {\n        if (a) { run(); }\n      } catch (e) { log(e); }\n    }\n  }\n}\n"
+        self.assertEqual(self.by_rule(self.scan_files({"a.js": four}), "RS-QUAL-002"), [])
+
+    def test_empty_catch(self):
+        src = ("try { a(); } catch (e) {}\n"
+               "try { b(); } catch {\n  // ignore\n}\n"
+               "try { c(); } catch (e) { console.error(e); }\n"
+               "try { d(); } catch (e) { /* nothing */ }\n")
+        findings = self.scan_files({"a.js": src})
+        hits = self.by_rule(findings, "RS-QUAL-004")
+        self.assertEqual(sorted(f.line for f in hits), [1, 2, 6])
+        self.assertTrue(all(f.severity == "medium" and f.confidence == "medium" for f in hits))
+
+    def test_test_files_skip_quality_rules(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return -1;\n}\n" % branches
+        findings = self.scan_files({"big.test.js": src, "__tests__/other.js": src, "src/big.js": src})
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-QUAL-001")], ["src/big.js"])
+
+
+class TestJsImportGraph(_ProjectMixin, unittest.TestCase):
+    def test_three_module_cycle_reported_once_with_path(self):
+        files = {"a.ts": "import { b } from './b';\nexport const a = 1;\n",
+                 "b.ts": "import { c } from './c';\nexport const b = 2;\n",
+                 "c.ts": "import { a } from './a';\nexport const c = 3;\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].severity, "high")
+        self.assertEqual(cycles[0].file, "a.ts")
+        self.assertEqual(cycles[0].line, 1)
+        self.assertIn("a -> b -> c -> a", cycles[0].message)
+
+    def test_js_extension_resolves_to_ts_and_index_import(self):
+        files = {"main.ts": "import { x } from './x.js';\n", "x.ts": "import './main';\n",
+                 "app.ts": "import u from './utils';\n", "utils/index.ts": "import '../app';\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        messages = sorted(c.message for c in cycles)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("app -> utils/index -> app", messages[0])
+        self.assertIn("main -> x -> main", messages[1])
+
+    def test_tsconfig_paths_alias_and_malformed_config(self):
+        tsconfig = ('{\n  // comment\n  "compilerOptions": {\n    "baseUrl": ".",\n'
+                    '    "paths": { "@/*": ["src/*"], },\n  },\n}\n')
+        files = {"tsconfig.json": tsconfig, "src/a.ts": "import b from '@/b';\n", "src/b.ts": "import a from '@/a';\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertIn("src/a -> src/b -> src/a", cycles[0].message)
+        root = self.make_project({"jsconfig.json": "{ not json at all", "a.js": "import './b';\n", "b.js": "import './a';\n"})
+        result = scan(root)
+        self.assertTrue(any("jsconfig.json" in w for w in result.warnings))
+        self.assertEqual(len(self.by_rule(result.findings, "RS-ARCH-001")), 1)
+
+    def test_type_only_dynamic_and_function_level_imports_are_soft(self):
+        files = {"a.ts": "import type { B } from './b';\nexport class A {}\n", "b.ts": "import { A } from './a';\nexport class B {}\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual([c.severity for c in cycles], ["low"])
+        self.assertIn("soft", cycles[0].message)
+        files = {"a.js": "const b = require('./b');\n", "b.js": "async function f() { const a = await import('./a'); return a; }\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual([c.severity for c in cycles], ["low"])
+        files = {"a.js": "const b = require('./b');\n", "b.js": "function f() { return require('./a'); }\n"}
+        self.assertEqual([c.severity for c in self.by_rule(self.scan_files(files), "RS-ARCH-001")], ["low"])
+
+    def test_self_import_bare_packages_and_comments(self):
+        files = {"s.ts": "import './s';\n",
+                 "ok.ts": "import React from 'react';\nimport fs from 'node:fs';\nconst _ = require('lodash');\n"
+                          "// import x from './s'\nconst t = \"import y from './s'\";\n"}
+        cycles = self.by_rule(self.scan_files(files), "RS-ARCH-001")
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].file, "s.ts")
+        self.assertIn("Self-import", cycles[0].message)
+
+    def test_long_chain_on_disk(self):
+        n = 5000
+        files = {"m%d.js" % i: "import './m%d';\n" % (i + 1) for i in range(n - 1)}
+        files["m%d.js" % (n - 1)] = "export const x = 1;\n"
+        self.assertEqual(self.by_rule(self.scan_files(files), "RS-ARCH-001"), [])
+
+    def test_layers_and_forbidden_imports(self):
+        files = {"src/api/routes.ts": "import { Model } from '../domain/models';\n",
+                 "src/domain/models.ts": "import { routes } from '../api/routes';\n"}
+        findings = self.scan_files(files, {"layers": ["api", "service", "domain"]})
+        layer = self.by_rule(findings, "RS-ARCH-002")
+        self.assertEqual([(f.file, f.line) for f in layer], [("src/domain/models.ts", 1)])
+        self.assertIn("'domain' must not import layer 'api'", layer[0].message)
+        findings = self.scan_files(files, {"forbidden_imports": [{"from": "domain", "to": "api"}]})
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-ARCH-002")], ["src/domain/models.ts"])
+
+
+class TestJsSecurity(_ProjectMixin, unittest.TestCase):
+    def test_sinks_on_masked_code(self):
+        src = ("const { exec } = require('child_process');\n"   # 1
+               "exec(userInput);\n"                              # 2 critical
+               "exec(\"ls\");\n"                                 # 3 medium
+               "eval(x);\n"                                      # 4 critical
+               "// eval(x)\n"                                    # 5 not flagged
+               "const s = \"eval(x)\";\n"                        # 6 not flagged
+               "el.innerHTML = x;\n"                             # 7 high
+               "el.innerHTML = \"<b>\";\n"                       # 8 medium
+               "exec(`rm -rf ${dir}`);\n"                        # 9 critical
+               "exec('ls' + dir);\n")                            # 10 critical
+        findings = self.scan_files({"a.js": src})
+        sev = {(f.line, f.rule_id): f.severity for f in findings if f.rule_id in ("RS-SEC-003", "RS-SEC-004")}
+        self.assertEqual(sev, {(2, "RS-SEC-003"): "critical", (3, "RS-SEC-003"): "medium", (4, "RS-SEC-004"): "critical",
+                               (7, "RS-SEC-004"): "high", (8, "RS-SEC-004"): "medium", (9, "RS-SEC-003"): "critical",
+                               (10, "RS-SEC-003"): "critical"})
+        self.assertTrue(SEVERITY_RANK[sev[(8, "RS-SEC-004")]] < SEVERITY_RANK[sev[(7, "RS-SEC-004")]])
+
+    def test_execa_and_shelljs_count_as_shell(self):
+        findings = self.scan_files({"a.js": "import { exec } from 'execa';\nexec(cmd);\n",
+                                    "b.js": "const sh = require('shelljs');\nsh.exec(cmd);\n",
+                                    "c.js": "const exec = (x) => x;\nexec(cmd);\n"})
+        self.assertEqual(sorted(f.file for f in self.by_rule(findings, "RS-SEC-003")), ["a.js", "b.js"])
+
+    def test_dangerously_set_inner_html(self):
+        src = ("export function View({ html }) {\n"
+               "  return (\n    <div>\n      <p dangerouslySetInnerHTML={{ __html: html }} />\n"
+               "      <p dangerouslySetInnerHTML={{__html: \"<b>static</b>\"}} />\n    </div>\n  );\n}\n")
+        findings = self.scan_files({"view.jsx": src})
+        hits = sorted((f.line, f.severity) for f in self.by_rule(findings, "RS-SEC-006"))
+        self.assertEqual(hits, [(4, "high"), (5, "low")])
+
+    SEC006 = (
+        "const https = require('https');\n"                                          # 1
+        "const crypto = require('crypto');\n"                                        # 2
+        "const fs = require('fs');\n"                                                # 3
+        "const agent = new https.Agent({ rejectUnauthorized: false });\n"            # 4 high
+        "const okAgent = new https.Agent({ rejectUnauthorized: true });\n"           # 5
+        "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';\n"                          # 6 high
+        "process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';\n"                          # 7
+        "// process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';\n"                       # 8
+        "const h1 = crypto.createHash('md5').update(pw).digest('hex');\n"            # 9 medium
+        "const h2 = crypto.createHash('sha256').update(pw).digest('hex');\n"         # 10
+        "const sessionToken = Math.random().toString(36).slice(2);\n"                # 11 medium
+        "const a1 = 1;\n"                                                            # 12
+        "const a2 = 2;\n"                                                            # 13
+        "const a3 = 3;\n"                                                            # 14
+        "const a4 = 4;\n"                                                            # 15
+        "const jitter = Math.random() * 100;\n"                                      # 16
+        "const b1 = 1;\n"                                                            # 17
+        "const b2 = 2;\n"                                                            # 18
+        "const b3 = 3;\n"                                                            # 19
+        "const b4 = 4;\n"                                                            # 20
+        "jwt.verify(t, key, { algorithms: ['HS256', 'none'] });\n"                   # 21 high
+        "jwt.verify(t, key, { algorithms: ['HS256'] });\n"                           # 22
+        "app.use(cors({ origin: '*', credentials: true }));\n"                       # 23 medium
+        "app.use(cors({ origin: '*' }));\n"                                          # 24
+        "app.use(cors({ origin: 'https://x.example', credentials: true }));\n"       # 25
+        "fs.readFile(`${base}/${req.query.name}`, cb);\n"                            # 26 medium
+        "fs.readFile('/etc/hosts', cb);\n"                                           # 27
+        "fs.unlinkSync(path.join(base, params.id));\n"                               # 28 medium
+        "const re1 = new RegExp(req.query.q);\n"                                     # 29 low
+        "const re2 = new RegExp('^abc$');\n"                                         # 30
+    )
+
+    def test_sec006_positives_and_negatives(self):
+        findings = self.scan_files({"server.js": self.SEC006})
+        hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(hits, {4: "high", 6: "high", 9: "medium", 11: "medium", 21: "high", 23: "medium",
+                                26: "medium", 28: "medium", 29: "low"})
+        self.assertTrue(all(f.confidence in ("low", "medium") and "approximate" in f.message
+                            for f in self.by_rule(findings, "RS-SEC-006")))
+
+    def test_sec006_downgraded_in_test_files(self):
+        findings = self.scan_files({"server.test.js": self.SEC006})
+        hits = {f.line: f.severity for f in self.by_rule(findings, "RS-SEC-006")}
+        self.assertEqual(hits, {4: "medium", 6: "medium", 9: "low", 11: "low", 21: "medium", 23: "low",
+                                26: "low", 28: "low", 29: "low"})
+
+    def test_list_rules_describes_sec006(self):
+        code, out, _ = self.run_cli(["--list-rules"])
+        self.assertEqual(code, 0)
+        self.assertIn("RS-SEC-006", out)
+        self.assertIn("JS/TS: pattern-based, approximate", out)
+
+
+class TestJsRobustnessAndCli(_ProjectMixin, unittest.TestCase):
+    AWS = "AKIA" + "J7Q2M9X4L1P8R6T3"
+
+    def test_secret_in_js_comment_detected_and_redacted(self):
+        root = self.make_project({"a.js": "// key: %s\nconst x = 1;\n" % self.AWS,
+                                  "b.js": "const t = `%s`;\n" % self.AWS})
+        result = scan(root)
+        hits = self.by_rule(result.findings, "RS-SEC-001")
+        self.assertEqual(sorted(f.file for f in hits), ["a.js", "b.js"])
+        self.assertTrue(all(f.severity == "critical" for f in hits))
+        for rendered in (render_terminal(result.findings, 2, "high", False), render_json(result.findings, 2, "high"),
+                         render_markdown(result.findings, 2, "high"), self.run_cli([root])[1],
+                         self.run_cli([root, "--format", "json"])[1], self.run_cli([root, "--format", "markdown"])[1]):
+            self.assertNotIn(self.AWS, rendered)
+            self.assertIn("AKIA****[len=20]", rendered)
+
+    def test_rules_ignore_override_suppression_and_baseline(self):
+        src = TestJsSecurity.SEC006
+        root = self.make_project({"server.js": src})
+        code, out, _ = self.run_cli([root, "--rules", "RS-SEC-006", "--format", "json"])
+        self.assertEqual(code, 1)
+        data = json.loads(out)
+        self.assertEqual({f["rule_id"] for f in data["findings"]}, {"RS-SEC-006"})
+        self.assertEqual(len(data["findings"]), 9)
+        code, out, _ = self.run_cli([root, "--ignore-rules", "RS-SEC-006", "--format", "json"])
+        self.assertNotIn("RS-SEC-006", {f["rule_id"] for f in json.loads(out)["findings"]})
+        findings = self.scan_files({"server.js": src}, {"severity_overrides": {"RS-SEC-006": "low"}})
+        self.assertTrue(all(f.severity == "low" for f in self.by_rule(findings, "RS-SEC-006")))
+        suppressed = src.replace("rejectUnauthorized: false });", "rejectUnauthorized: false }); // reposentry: ignore RS-SEC-006")
+        findings = self.scan_files({"server.js": suppressed})
+        self.assertNotIn(4, [f.line for f in self.by_rule(findings, "RS-SEC-006")])
+        baseline = os.path.join(root, "baseline.json")
+        self.assertEqual(self.run_cli([root, "--rules", "RS-SEC-006", "--write-baseline", baseline])[0], 1)
+        code, out, _ = self.run_cli([root, "--rules", "RS-SEC-006", "--baseline", baseline, "--format", "json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["summary"]["total"], 0)
+
+    def test_json_identical_across_runs_and_crlf(self):
+        files = {"a.ts": "import { b } from './b';\nfunction f(x) {\n  if (x) { eval(x); }\n  try { g(); } catch (e) {}\n}\n",
+                 "b.ts": "import { a } from './a';\nexport const b = 1;\n"}
+        root_lf = self.make_project(files)
+        root_crlf = self.make_project({k: v.replace("\n", "\r\n") for k, v in files.items()})
+        out1 = self.run_cli([root_lf, "--format", "json"])[1]
+        out2 = self.run_cli([root_lf, "--format", "json"])[1]
+        out3 = self.run_cli([root_crlf, "--format", "json"])[1]
+        self.assertEqual(out1, out2)
+        self.assertEqual(out1, out3)
+        findings = json.loads(out1)["findings"]
+        self.assertEqual(sorted((f["rule_id"], f["file"], f["line"]) for f in findings),
+                         [("RS-ARCH-001", "a.ts", 1), ("RS-QUAL-004", "a.ts", 4), ("RS-SEC-004", "a.ts", 3)])
+
+    def test_pathological_inputs_finish_quickly(self):
+        import time as _time
+        files = {"parens.js": "f" + "(" * 200000 + ")" * 200000 + ";\n",
+                 "oneline.js": "var x = 1;" + " x = x + 1;" * 90000 + "\n",
+                 "template.js": "const t = `never closed ${a + b\nfunction f() { if (x) { eval(x); } }\n",
+                 "binary.js": b"\x00\x01\x02eval(x)\n",
+                 "braces.js": "{" * 100000 + "}" * 100000 + "\n"}
+        root = self.make_project(files)
+        started = _time.time()
+        result = scan(root)
+        self.assertLess(_time.time() - started, 5.0)
+        self.assertEqual(self.by_rule(result.findings, "RS-SYS-001"), [])
+        self.assertEqual(result.scanned_files, 4)
+
+    def test_untokenizable_file_yields_sys_finding_and_scan_continues(self):
+        from unittest import mock
+        root = self.make_project({"bad.js": "const a = 1;\n", "good.js": "eval(x);\n"})
+        original = js_mask
+
+        def boom(text, jsx=True):
+            if "const a" in text:
+                raise ValueError("synthetic tokenizer failure")
+            return original(text, jsx)
+
+        with mock.patch.dict(globals(), {"js_mask": boom}):
+            findings = scan(root).findings
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-SYS-001")], ["bad.js"])
+        self.assertEqual(self.by_rule(findings, "RS-SYS-001")[0].severity, "low")
+        self.assertEqual([f.file for f in self.by_rule(findings, "RS-SEC-004")], ["good.js"])
+
+    def test_declaration_minified_and_ignored_dirs_skipped(self):
+        branches = "".join("  if (x === %d) { return %d; }\n" % (i, i) for i in range(12))
+        src = "function big(x) {\n%s  return eval(x);\n}\n" % branches
+        files = {"types.d.ts": src, "bundle.min.js": src, "app.js.map": "{\"mappings\": \"%s\"}\n" % ("AAAA" * 30),
+                 "coverage/lcov.js": src, ".next/x.js": src, "out/y.js": src, "src/real.js": src,
+                 "packed.js": "var a=1;" + "a=a+1;" * 400 + "eval(x);\n"}
+        root = self.make_project(files)
+        result = scan(root)
+        self.assertEqual({f.file for f in result.findings}, {"src/real.js"})
+        self.assertEqual({f.rule_id for f in result.findings}, {"RS-QUAL-001", "RS-SEC-004"})
+
+    def test_dogfood_express_project(self):
+        branches = "".join("  if (kind === %d) { return %d; }\n" % (i, i) for i in range(25))
+        files = {
+            "package.json": '{"name": "demo", "dependencies": {"express": "^4.18.0"}}\n',
+            "app.js": ("const express = require('express');\nconst routes = require('./routes');\n"
+                       "const config = require('./config');\nconst app = express();\napp.use(routes);\n"
+                       "app.listen(config.port);\n"),
+            "config.js": "module.exports = { port: 3000, name: 'demo' };\n",
+            "routes.js": ("const { exec } = require('child_process');\nconst { Router } = require('express');\n"
+                          "const { helper } = require('./utils');\nconst router = Router();\n"
+                          "router.get('/run', (req, res) => {\n  exec(req.query.cmd, (err, out) => res.send(helper(out)));\n});\n"
+                          "module.exports = router;\n"),
+            "utils.js": ("const routes = require('./routes');\nfunction classify(kind) {\n%s  return -1;\n}\n"
+                         "function helper(out) { return String(out); }\nmodule.exports = { classify, helper, routes };\n" % branches),
+            "db.js": ("const { connect } = require('./config');\nasync function init() {\n  try {\n    await connect();\n"
+                      "  } catch (e) {}\n}\nmodule.exports = { init };\n"),
+            "middleware/auth.js": ("module.exports = function auth(req, res, next) {\n  if (!req.headers.authorization) {\n"
+                                   "    return res.status(401).end();\n  }\n  next();\n};\n"),
+        }
+        findings = self.scan_files(files)
+        self.assertEqual(sorted({(f.rule_id, f.file) for f in findings}),
+                         [("RS-ARCH-001", "routes.js"), ("RS-QUAL-001", "utils.js"), ("RS-QUAL-004", "db.js"),
+                          ("RS-SEC-003", "routes.js")])
+        self.assertEqual(len(findings), 4)
+        sec = self.by_rule(findings, "RS-SEC-003")[0]
+        self.assertEqual((sec.severity, sec.line), ("critical", 6))
+        self.assertIn("routes -> utils -> routes", self.by_rule(findings, "RS-ARCH-001")[0].message)
 
 
 if __name__ == "__main__":
