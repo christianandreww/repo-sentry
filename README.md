@@ -62,18 +62,54 @@ secrets used by the test suite carry `reposentry: ignore` directives.
 
 ## Usage
 
+Needs Python 3.9+ and nothing else. Copy `repo_sentry.py` anywhere and run it.
+
 ```
-python repo_sentry.py [path] [--format terminal|json|markdown]
-                      [--fail-on-severity low|medium|high|critical]
-                      [--rules RS-SEC-*] [--ignore-rules RS-QUAL-002]
-                      [--config .reposentry.json]
-                      [--baseline FILE] [--write-baseline FILE]
-                      [--max-file-kb N] [--no-color] [--list-rules]
-                      [--self-test] [--version]
+python repo_sentry.py --self-test           # optional: embedded test suite
+python repo_sentry.py path/to/project       # scan a folder (default: .)
 ```
 
-A `.reposentry.json` in the scan root is picked up automatically; see the
-config block in `prompts/repo-sentry.prompt.md` for the schema.
+| Task | Command |
+|---|---|
+| Scan the current folder | `python repo_sentry.py .` |
+| Report to read or share | `python repo_sentry.py . --format markdown > report.md` |
+| Machine-readable output | `--format json` |
+| Only some rules | `--rules "RS-SEC-*"` |
+| Skip a rule | `--ignore-rules RS-QUAL-002` |
+| List every rule | `--list-rules` |
+| Secrets deleted in later commits | `--history` (needs git; `--history-max N` commits, default 500) |
+| Change the pass/fail threshold | `--fail-on-severity medium` (default `high`) |
+| Skip big files | `--max-file-kb 512` (default 1024) |
+
+Each finding shows the rule ID, severity, confidence, `file:line:col`, the offending line (secrets
+redacted) and a suggested fix.
+
+### Living with findings
+
+- **One line:** add `# reposentry: ignore RS-SEC-003` (or `// …` in JS/TS). A trailing comment silences
+  its own line; a comment on a line of its own silences the line below. Omit the ID to silence every rule.
+- **Existing debt:** `--write-baseline baseline.json` once, then run with `--baseline baseline.json`
+  so only new findings show.
+- **Project settings:** a `.reposentry.json` in the scan root is loaded automatically, for example:
+
+```json
+{
+  "ignore_dirs": [".git", "node_modules", "venv", "dist"],
+  "thresholds": {"max_cyclomatic_complexity": 12, "max_nesting_depth": 4},
+  "severity_overrides": {"RS-QUAL-002": "low"}
+}
+```
+
+  The full schema (layers, forbidden imports, package roots, extra sinks) is in
+  `prompts/repo-sentry.prompt.md`.
+
+### In CI
+
+```yaml
+- run: python repo_sentry.py . --fail-on-severity high --format markdown >> "$GITHUB_STEP_SUMMARY"
+```
+
+Exit codes: `0` pass, `1` findings at or above the threshold, `2` tool, config or usage error.
 
 ## Repo layout
 

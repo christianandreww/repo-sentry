@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 TOOL_NAME = "repo_sentry"
 
 SEVERITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -569,6 +569,7 @@ def is_minified(rel: str, lines: Sequence[str]) -> bool:
 # --------------------------------------------------------------------------
 # Source file holder with secret redaction
 # --------------------------------------------------------------------------
+COMMENT_PREFIXES = ("#", "//", "/*", "*", "--", ";", "<!--", "{/*")
 DIRECTIVE_RE = re.compile(r"reposentry:\s*ignore\b((?:\s*,?\s*RS-[A-Z]+-\d{3})*)", re.IGNORECASE)
 
 
@@ -582,12 +583,17 @@ class SourceFile:
         self.redactions: Dict[int, List[Tuple[int, int]]] = {}
         self.redacted_lines: Set[int] = set()
         self.directives: Dict[int, Set[str]] = {}
+        # Lines whose directive is the whole line (a comment on its own). Only these also cover the NEXT
+        # line; a trailing comment after code covers its own line only.
+        self.standalone_directives: Set[int] = set()
         for idx, line in enumerate(self.lines, 1):
             if "reposentry" in line.lower():
                 m = DIRECTIVE_RE.search(line)
                 if m:
                     ids = set(RULE_ID_RE.findall(m.group(1) or ""))
                     self.directives[idx] = {i.upper() for i in ids} if ids else {"*"}
+                    if line.lstrip().startswith(COMMENT_PREFIXES):
+                        self.standalone_directives.add(idx)
 
     def add_redaction(self, line: int, start: int, end: int) -> None:
         self.redactions.setdefault(line, []).append((start, end))
@@ -623,6 +629,8 @@ class SourceFile:
 
     def is_suppressed(self, line: int, rule_id: str) -> bool:
         for ln in (line, line - 1):
+            if ln != line and ln not in self.standalone_directives:
+                continue
             ids = self.directives.get(ln)
             if ids and ("*" in ids or rule_id in ids):
                 return True
@@ -774,8 +782,8 @@ def scan_secrets(sf: SourceFile, config: Config, emit, entropy_enabled: bool) ->
                 sf.redacted_lines.add(j + 1)
             n_lines = end_idx - idx + 2
             emit(Finding("RS-SEC-001", "critical", "high", sf.rel, lineno, m.start() + 1,
-                         "PEM private key block detected (%d lines, redacted)" % n_lines,  # reposentry: ignore RS-SEC-001
-                         "-----BEGIN PRIVATE KEY----- … %d line(s) redacted … -----END PRIVATE KEY-----" % n_lines,
+                         "PEM private key block detected (%d lines, redacted)" % n_lines,
+                         "-----BEGIN PRIVATE KEY----- … %d line(s) redacted … -----END PRIVATE KEY-----" % n_lines,  # reposentry: ignore RS-SEC-001
                          remediation))
             idx = end_idx + 1
             continue
@@ -6986,6 +6994,7 @@ class Scanner:
         self.js_aliases: List[JsPathAliases] = []
         self.js_known: Set[str] = set()
         self._directives: Dict[str, Dict[int, Set[str]]] = {}
+        self._standalone: Dict[str, Set[int]] = {}
         self._seen: Set[Tuple[str, str, int, int]] = set()
         self._current: Optional[SourceFile] = None
         self.indents: Dict[Tuple[str, int], int] = {}
@@ -7005,7 +7014,10 @@ class Scanner:
             finding.severity = override
         directives = self._directives.get(finding.file)
         if directives:
+            standalone = self._standalone.get(finding.file, set())
             for ln in (finding.line, finding.line - 1):
+                if ln != finding.line and ln not in standalone:
+                    continue
                 ids = directives.get(ln)
                 if ids and ("*" in ids or finding.rule_id in ids):
                     self.suppressed += 1
@@ -7057,6 +7069,7 @@ class Scanner:
         lang = detect_language(entry.rel, first_line)
         sf = SourceFile(entry.rel, entry.path, text, lang)
         self._directives[entry.rel] = sf.directives
+        self._standalone[entry.rel] = sf.standalone_directives
         self._current = sf
         self.scanned += 1
         if decode_error is not None:
@@ -8165,6 +8178,15 @@ class TestConfig(_ProjectMixin, unittest.TestCase):
                "os.system(w)  # reposentry: ignore RS-QUAL-003\n")
         findings = self.scan_files({"a.py": src})
         self.assertEqual(sorted(f.line for f in self.by_rule(findings, "RS-SEC-003")), [5, 6])
+
+    def test_trailing_suppression_does_not_cover_next_line(self):
+        # A trailing directive silences its own line only; a comment-only line covers the line below it.
+        src = ("import os\nos.system(x)  # reposentry: ignore RS-SEC-003\nos.system(y)\n")
+        findings = self.scan_files({"a.py": src})
+        self.assertEqual([f.line for f in self.by_rule(findings, "RS-SEC-003")], [3])
+        js = "const cp = require('child_process');\ncp.exec(a); // reposentry: ignore RS-SEC-003\ncp.exec(b);\n"
+        findings = self.scan_files({"a.js": js})
+        self.assertEqual([f.line for f in self.by_rule(findings, "RS-SEC-003")], [3])
 
     def test_baseline_roundtrip(self):
         root = self.make_project({"a.py": "import os\nos.system(x)\n"})
