@@ -10,6 +10,7 @@ Planned checks:
 - **Quality:** cyclomatic complexity, deep nesting, bare or swallowed exceptions
 - **Security:** secret scanning (patterns + Shannon entropy), command injection and dynamic-execution sinks (Python is parsed with `ast`; JS/TS are lexically masked and pattern-analysed; C/C++ and shell are pattern-based)
 - **JS/TS configuration:** TLS verification off, weak hashes for credentials, `Math.random()` for secrets, JWT `none`, wildcard CORS with credentials, `dangerouslySetInnerHTML`, user-controlled `fs` paths and `RegExp` patterns (RS-SEC-006)
+- **JS/TS async and resources (approximate):** blocking `*Sync` calls inside `async` functions (RS-ASYNC-001), floating promises, `forEach(async ...)` and `.then()` without a rejection handler (RS-ASYNC-002), and write streams / sockets / file handles that are never closed, piped, returned or stored (RS-RES-001). Heuristic, medium/low confidence; test files are skipped.
 - **History:** `--history` scans past commits for secrets that were added and later removed (RS-SEC-005; needs `git`)
 - **Example files:** `.env.example`, `*.sample.*` etc. skip well-known default passwords and downgrade other heuristic hits to low; real tokens (AWS, GitHub...) stay critical
 - **Output:** terminal (ANSI), JSON and Markdown, with CI-friendly exit codes
@@ -36,7 +37,7 @@ JS/TS support is deliberately approximate and every JS/TS finding says so:
 
 ## Status
 
-`repo_sentry.py` (v1.2.0) is generated and checked in. It implements every
+`repo_sentry.py` (v1.3.0) is generated and checked in. It implements every
 rule and CLI option in `prompts/repo-sentry.prompt.md` plus the JS/TS
 extension in `prompts/repo-sentry-js-ts.prompt.md`, and ships with an
 embedded unittest suite (106 tests) that runs via
